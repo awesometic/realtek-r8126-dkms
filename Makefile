@@ -30,30 +30,30 @@
 #  US6,570,884, US6,115,776, and US6,327,625.
 ################################################################################
 
-KFLAG := 2$(shell uname -r | sed -ne 's/^2\.[4]\..*/4/p')x
+# To pass the dkms.conf parameters to the Makefile,
+# add KVER and BASEDIR to the Make command line
+KFLAG := 2$(shell "$KVER" | sed -ne 's/^2\.[4]\..*/4/p')x
+BSRC ?= /lib/modules/$(shell uname -r)
 
 all: clean modules install
 
 modules:
 ifeq ($(KFLAG),24x)
-	$(MAKE) -C src/ -f Makefile_linux24x modules
+	$(MAKE) -C src/ KVER=$(KVER) BASEDIR=$(BSRC) -f Makefile_linux24x modules
 else
-	$(MAKE) -C src/ modules
+	$(MAKE) -C src/ KVER=$(KVER) BASEDIR=$(BSRC) modules
 endif
 
 clean:
 ifeq ($(KFLAG),24x)
-	$(MAKE) -C src/ -f Makefile_linux24x clean
+	$(MAKE) -C src/ KVER=$(KVER) BASEDIR=$(BSRC) -f Makefile_linux24x clean
 else
-	$(MAKE) -C src/ clean
+	$(MAKE) -C src/ KVER=$(KVER) BASEDIR=$(BSRC) clean
 endif
 
-install:
+install: modules
 ifeq ($(KFLAG),24x)
-	$(MAKE) -C src/ -f Makefile_linux24x install
+	$(MAKE) -C src/ KVER=$(KVER) BASEDIR=$(BSRC) -f Makefile_linux24x install
 else
-	$(MAKE) -C src/ install
+	$(MAKE) -C src/ KVER=$(KVER) BASEDIR=$(BSRC) install
 endif
-
-
-
