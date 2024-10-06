@@ -1,0 +1,6 @@
+realtek-r8126-dkms for Debian
+
+The driver source can be found here:
+ https://www.realtek.com/Download/List?cate_id=584
+
+ -- Deokgyu Yang <secugyu@gmail.com>  Tue, 06 Oct 2024 11:08:35 +0900

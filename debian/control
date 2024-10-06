@@ -1,0 +1,16 @@
+Source: realtek-r8126-dkms
+Section: contrib/kernel
+Priority: optional
+Maintainer: Deokgyu Yang <secugyu@gmail.com>
+Build-Depends: debhelper (>=11~), dkms (<< 3.0.3-3~) | dh-sequence-dkms
+Standards-Version: 4.6.2.1
+Homepage: https://github.com/awesometic/realtek-r8126-dkms
+
+Package: realtek-r8126-dkms
+Architecture: any
+Multi-Arch: foreign
+Depends: dkms (>= 1.95), ${misc:Depends}
+Description: Realtek RTL8126 driver in DKMS format
+  This package provides the source code for RTL8126 Linux driver that may
+  include supporting other Realtek 5 GbE chipsets to be build with dkms.
+  Kernel sources or headers are required to compile this module.

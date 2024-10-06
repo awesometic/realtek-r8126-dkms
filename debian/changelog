@@ -1,0 +1,5 @@
+realtek-r8126-dkms (10.013.00-1) stable; urgency=medium
+
+  * Initial package with r8126 10.013.00 driver by Realtek
+
+ -- Deokgyu Yang <secugyu@gmail.com>  Tue, 06 Oct 2024 11:08:35 +0900
