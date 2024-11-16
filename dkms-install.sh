@@ -9,7 +9,7 @@ fi
 
 DRV_DIR="$(pwd)"
 DRV_NAME=r8126
-DRV_VERSION=10.013.00
+DRV_VERSION=10.014.01
 
 cp -r ${DRV_DIR} /usr/src/${DRV_NAME}-${DRV_VERSION}
 
