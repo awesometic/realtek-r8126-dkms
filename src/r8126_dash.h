@@ -175,10 +175,10 @@ RX_DASH_BUFFER_TYPE_2, *PRX_DASH_BUFFER_TYPE_2;
 #define OCP_REG_CONFIG0_DRV_WAIT_OOB     BIT_8
 #define OCP_REG_CONFIG0_TLSEN            BIT_7
 
-#define HW_DASH_SUPPORT_DASH(_M)        ((_M)->HwSuppDashVer > 0 )
-#define HW_DASH_SUPPORT_TYPE_1(_M)        ((_M)->HwSuppDashVer == 1 )
-#define HW_DASH_SUPPORT_TYPE_2(_M)        ((_M)->HwSuppDashVer == 2 )
-#define HW_DASH_SUPPORT_TYPE_3(_M)        ((_M)->HwSuppDashVer == 3 )
+#define HW_DASH_SUPPORT_DASH(_M)        ((_M)->HwSuppDashVer > 0)
+#define HW_DASH_SUPPORT_TYPE_1(_M)        ((_M)->HwSuppDashVer == 1)
+#define HW_DASH_SUPPORT_TYPE_2(_M)        ((_M)->HwSuppDashVer == 2)
+#define HW_DASH_SUPPORT_TYPE_3(_M)        ((_M)->HwSuppDashVer == 3)
 
 #define RECV_FROM_FW_BUF_SIZE (1520)
 #define SEND_TO_FW_BUF_SIZE (1520)

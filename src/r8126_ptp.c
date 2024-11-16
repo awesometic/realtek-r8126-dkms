@@ -45,57 +45,90 @@
 #include "r8126.h"
 #include "r8126_ptp.h"
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,6,0)
-static inline struct timespec timespec64_to_timespec(const struct timespec64 ts64)
+static void rtl8126_wait_clkadj_ready(struct rtl8126_private *tp)
 {
-        return *(const struct timespec *)&ts64;
+        int i;
+
+        for (i = 0; i < R8126_CHANNEL_WAIT_COUNT; i++)
+                if (!(rtl8126_mdio_direct_read_phy_ocp(tp, PTP_CLK_CFG_8126) & CLKADJ_MODE_SET))
+                        break;
 }
 
-static inline struct timespec64 timespec_to_timespec64(const struct timespec ts)
+static void rtl8126_set_clkadj_mode(struct rtl8126_private *tp, u16 cmd)
 {
-        return *(const struct timespec64 *)&ts;
+        rtl8126_clear_and_set_eth_phy_ocp_bit(tp,
+                                              PTP_CLK_CFG_8126,
+                                              BIT_3 | BIT_2 | BIT_1,
+                                              CLKADJ_MODE_SET | cmd);
+
+        rtl8126_wait_clkadj_ready(tp);
 }
-#endif
 
 static int _rtl8126_phc_gettime(struct rtl8126_private *tp, struct timespec64 *ts64)
 {
-        //get local time
-        RTL_W16(tp, PTP_TIME_CORRECT_CMD_8125, (PTP_CMD_LATCHED_LOCAL_TIME | PTP_EXEC_CMD));
+        unsigned long flags;
+
+        spin_lock_irqsave(&tp->phy_lock, flags);
+
+        //Direct Read
+        rtl8126_set_clkadj_mode(tp, DIRECT_READ);
 
         /* nanoseconds */
-        //0x6808[29:0]
-        ts64->tv_nsec = (RTL_R32(tp, PTP_SOFT_CONFIG_Time_NS_8125) & 0x3fffffff);
+        //Ns[29:16] E414[13:0]
+        ts64->tv_nsec = rtl8126_mdio_direct_read_phy_ocp(tp, PTP_CFG_NS_HI_8126) & 0x3fff;
+        ts64->tv_nsec <<= 16;
+        //Ns[15:0]  E412[15:0]
+        ts64->tv_nsec |= rtl8126_mdio_direct_read_phy_ocp(tp, PTP_CFG_NS_LO_8126);
+
 
         /* seconds */
-        //0x680C[47:0]
-        ts64->tv_sec = RTL_R16(tp, PTP_SOFT_CONFIG_Time_S_8125 + 4);
-        ts64->tv_sec <<= 32;
-        ts64->tv_sec |= RTL_R32(tp, PTP_SOFT_CONFIG_Time_S_8125);
+        //S[47:32] E41A[15:0]
+        ts64->tv_sec = rtl8126_mdio_direct_read_phy_ocp(tp, PTP_CFG_S_HI_8126);
+        ts64->tv_sec <<= 16;
+        //S[31:16] E418[15:0]
+        ts64->tv_sec |= rtl8126_mdio_direct_read_phy_ocp(tp, PTP_CFG_S_MI_8126);
+        ts64->tv_sec <<= 16;
+        //S[15:0]  E416[15:0]
+        ts64->tv_sec |= rtl8126_mdio_direct_read_phy_ocp(tp, PTP_CFG_S_LO_8126);
+
+        spin_unlock_irqrestore(&tp->phy_lock, flags);
 
         return 0;
 }
 
 static int _rtl8126_phc_settime(struct rtl8126_private *tp, const struct timespec64 *ts64)
 {
+        unsigned long flags;
+
+        spin_lock_irqsave(&tp->phy_lock, flags);
+
         /* nanoseconds */
-        //0x6808[29:0]
-        RTL_W32(tp, PTP_SOFT_CONFIG_Time_NS_8125, (ts64->tv_nsec & 0x3fffffff));
+        //Ns[15:0]  E412[15:0]
+        rtl8126_mdio_direct_write_phy_ocp(tp, PTP_CFG_NS_LO_8126, ts64->tv_nsec);
+        //Ns[29:16] E414[13:0]
+        rtl8126_mdio_direct_write_phy_ocp(tp, PTP_CFG_NS_HI_8126, (ts64->tv_nsec & 0x3fff0000) >> 16);
 
         /* seconds */
-        //0x680C[47:0]
-        RTL_W32(tp, PTP_SOFT_CONFIG_Time_S_8125, ts64->tv_sec);
-        RTL_W16(tp, PTP_SOFT_CONFIG_Time_S_8125 + 4, (ts64->tv_sec >> 32));
+        //S[15:0]  E416[15:0]
+        rtl8126_mdio_direct_write_phy_ocp(tp, PTP_CFG_S_LO_8126, ts64->tv_sec);
+        //S[31:16] E418[15:0]
+        rtl8126_mdio_direct_write_phy_ocp(tp, PTP_CFG_S_MI_8126, (ts64->tv_sec >> 16));
+        //S[47:32] E41A[15:0]
+        rtl8126_mdio_direct_write_phy_ocp(tp, PTP_CFG_S_HI_8126, (ts64->tv_sec >> 32));
 
-        //set local time
-        RTL_W16(tp, PTP_TIME_CORRECT_CMD_8125, (PTP_CMD_SET_LOCAL_TIME | PTP_EXEC_CMD));
+        //Direct Write
+        rtl8126_set_clkadj_mode(tp, DIRECT_WRITE);
+
+        spin_unlock_irqrestore(&tp->phy_lock, flags);
 
         return 0;
 }
 
 static int _rtl8126_phc_adjtime(struct rtl8126_private *tp, s64 delta)
 {
+        unsigned long flags;
         struct timespec64 d;
-        bool negative = false;
+        bool negative;
         u64 tohw;
         u32 nsec;
         u64 sec;
@@ -104,6 +137,7 @@ static int _rtl8126_phc_adjtime(struct rtl8126_private *tp, s64 delta)
                 negative = true;
                 tohw = -delta;
         } else {
+                negative = false;
                 tohw = delta;
         }
 
@@ -112,31 +146,31 @@ static int _rtl8126_phc_adjtime(struct rtl8126_private *tp, s64 delta)
         nsec = d.tv_nsec;
         sec = d.tv_sec;
 
-        if (negative) {
-                nsec = -nsec;
-                sec = -sec;
-        }
-
         nsec &= 0x3fffffff;
         sec &= 0x0000ffffffffffff;
 
-        if (negative) {
-                nsec |= PTP_SOFT_CONFIG_TIME_NS_NEGATIVE;
-                sec |= PTP_SOFT_CONFIG_TIME_S_NEGATIVE;
-        }
+        spin_lock_irqsave(&tp->phy_lock, flags);
 
         /* nanoseconds */
-        //0x6808[29:0]
-        RTL_W32(tp, PTP_SOFT_CONFIG_Time_NS_8125, nsec);
+        //Ns[15:0]  E412[15:0]
+        rtl8126_mdio_direct_write_phy_ocp(tp, PTP_CFG_NS_LO_8126, nsec);
+        //Ns[29:16] E414[13:0]
+        rtl8126_mdio_direct_write_phy_ocp(tp, PTP_CFG_NS_HI_8126, (nsec >> 16));
 
         /* seconds */
-        //0x680C[47:0]
-        RTL_W32(tp, PTP_SOFT_CONFIG_Time_S_8125, sec);
-        RTL_W16(tp, PTP_SOFT_CONFIG_Time_S_8125 + 4, (sec >> 32));
+        //S[15:0]  E416[15:0]
+        rtl8126_mdio_direct_write_phy_ocp(tp, PTP_CFG_S_LO_8126, sec);
+        //S[31:16] E418[15:0]
+        rtl8126_mdio_direct_write_phy_ocp(tp, PTP_CFG_S_MI_8126, (sec >> 16));
+        //S[47:32] E41A[15:0]
+        rtl8126_mdio_direct_write_phy_ocp(tp, PTP_CFG_S_HI_8126, (sec >> 32));
 
-        //adjust local time
-        //RTL_W16(tp, PTP_TIME_CORRECT_CMD_8125, (PTP_CMD_DRIFT_LOCAL_TIME | PTP_EXEC_CMD));
-        RTL_W16(tp, PTP_TIME_CORRECT_CMD_8125, (PTP_CMD_SET_LOCAL_TIME | PTP_EXEC_CMD));
+        if (negative)
+                rtl8126_set_clkadj_mode(tp, DECREMENT_STEP);
+        else
+                rtl8126_set_clkadj_mode(tp, INCREMENT_STEP);
+
+        spin_unlock_irqrestore(&tp->phy_lock, flags);
 
         return 0;
 }
@@ -148,57 +182,60 @@ static int rtl8126_phc_adjtime(struct ptp_clock_info *ptp, s64 delta)
 
         //netif_info(tp, drv, tp->dev, "phc adjust time\n");
 
-        rtnl_lock();
         ret = _rtl8126_phc_adjtime(tp, delta);
-        rtnl_unlock();
 
         return ret;
 }
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6,2,0)
 /*
-1ppm means every 125MHz plus 125Hz. It also means every 8ns minus 8ns*10^(-6)
-
-1ns=2^30 sub_ns
-
-8ns*10^(-6) = 8 * 2^30 sub_ns * 10^(-6) = 2^33 sub_ns * 10^(-6) = 8590 = 0x218E sub_ns
-
-1ppb means every 125MHz plus 0.125Hz. It also means every 8ns minus 8ns*10^(-9)
-
-1ns=2^30 sub_ns
-
-8ns*10^(-9) = 8 * 2^30 sub_ns * 10^(-9) = 2^33 sub_ns * 10^(-9) = 8.59 sub_ns = 9 sub_ns
-*/
+ * delta = delta * 10^6 ppm = delta * 10^9 ppb (in this equation ppm and ppb are not variable)
+ *
+ * in adjfreq ppb is a variable
+ * ppb = delta * 10^9
+ * delta = ppb / 10^9
+ * rate_value = |delta| * 2^32 = |ppb| / 10^9 * 2^32 = (|ppb| << 32) / 10^9
+ */
 static int _rtl8126_phc_adjfreq(struct ptp_clock_info *ptp, s32 ppb)
 {
         struct rtl8126_private *tp = container_of(ptp, struct rtl8126_private, ptp_clock_info);
-        bool negative = false;
-        u32 sub_ns;
+        unsigned long flags;
+        u32 rate_value;
 
         if (ppb < 0) {
-                negative = true;
-                ppb = -ppb;
-        }
-
-        sub_ns = ppb * 9;
-        if (negative) {
-                sub_ns = -sub_ns;
-                sub_ns &= 0x3fffffff;
-                sub_ns |= PTP_ADJUST_TIME_NS_NEGATIVE;
+                rate_value = ((u64)-ppb << 32) / 1000000000;
+                rate_value = ~rate_value + 1;
         } else
-                sub_ns &= 0x3fffffff;
+                rate_value = ((u64)ppb << 32) / 1000000000;
+
+        spin_lock_irqsave(&tp->phy_lock, flags);
 
         /* nanoseconds */
-        //0x6808[29:0]
-        RTL_W32(tp, PTP_SOFT_CONFIG_Time_NS_8125, sub_ns);
+        //Ns[15:0]  E412[15:0]
+        rtl8126_mdio_direct_write_phy_ocp(tp, PTP_CFG_NS_LO_8126, rate_value);
+        //Ns[22:16] E414[13:0]
+        rtl8126_mdio_direct_write_phy_ocp(tp, PTP_CFG_NS_HI_8126, (rate_value & 0x003f0000) >> 16);
 
-        //adjust local time
-        RTL_W16(tp, PTP_TIME_CORRECT_CMD_8125, (PTP_CMD_DRIFT_LOCAL_TIME | PTP_EXEC_CMD));
-        //RTL_W16(tp, PTP_TIME_CORRECT_CMD_8125, (PTP_CMD_SET_LOCAL_TIME | PTP_EXEC_CMD));
+        rtl8126_set_clkadj_mode(tp, RATE_WRITE);
+
+        spin_unlock_irqrestore(&tp->phy_lock, flags);
 
         return 0;
 }
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,2,0)
+static int rtl8126_ptp_adjfine(struct ptp_clock_info *ptp, long scaled_ppm)
+{
+        s32 ppb = scaled_ppm_to_ppb(scaled_ppm);
+
+        if (ppb > ptp->max_adj || ppb < -ptp->max_adj)
+                return -EINVAL;
+
+        _rtl8126_phc_adjfreq(ptp, ppb);
+
+        return 0;
+}
+
+#else
 static int rtl8126_phc_adjfreq(struct ptp_clock_info *ptp, s32 delta)
 {
         //struct rtl8126_private *tp = container_of(ptp, struct rtl8126_private, ptp_clock_info);
@@ -212,8 +249,24 @@ static int rtl8126_phc_adjfreq(struct ptp_clock_info *ptp, s32 delta)
 
         return 0;
 }
-#endif //LINUX_VERSION_CODE < KERNEL_VERSION(6,2,0)
+#endif /* LINUX_VERSION_CODE >= KERNEL_VERSION(6,2,0) */
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,0,0)
+static int rtl8126_phc_gettime(struct ptp_clock_info *ptp, struct timespec64 *ts64,
+                               struct ptp_system_timestamp *sts)
+{
+        struct rtl8126_private *tp = container_of(ptp, struct rtl8126_private, ptp_clock_info);
+        int ret;
+
+        //netif_info(tp, drv, tp->dev, "phc get ts\n");
+
+        ptp_read_system_prets(sts);
+        ret = _rtl8126_phc_gettime(tp, ts64);
+        ptp_read_system_postts(sts);
+
+        return ret;
+}
+#else
 static int rtl8126_phc_gettime(struct ptp_clock_info *ptp, struct timespec64 *ts64)
 {
         struct rtl8126_private *tp = container_of(ptp, struct rtl8126_private, ptp_clock_info);
@@ -221,12 +274,11 @@ static int rtl8126_phc_gettime(struct ptp_clock_info *ptp, struct timespec64 *ts
 
         //netif_info(tp, drv, tp->dev, "phc get ts\n");
 
-        rtnl_lock();
         ret = _rtl8126_phc_gettime(tp, ts64);
-        rtnl_unlock();
 
         return ret;
 }
+#endif /* LINUX_VERSION_CODE >= KERNEL_VERSION(5,0,0) */
 
 static int rtl8126_phc_settime(struct ptp_clock_info *ptp,
                                const struct timespec64 *ts64)
@@ -236,36 +288,72 @@ static int rtl8126_phc_settime(struct ptp_clock_info *ptp,
 
         //netif_info(tp, drv, tp->dev, "phc set ts\n");
 
-        rtnl_lock();
         ret = _rtl8126_phc_settime(tp, ts64);
-        rtnl_unlock();
 
         return ret;
+}
+
+static void _rtl8126_phc_enable(struct ptp_clock_info *ptp,
+                                struct ptp_clock_request *rq, int on)
+{
+        struct rtl8126_private *tp = container_of(ptp, struct rtl8126_private, ptp_clock_info);
+        unsigned long flags;
+        u16 phy_ocp_data;
+
+        if (on) {
+                tp->pps_enable = 1;
+                rtl8126_clear_mac_ocp_bit(tp, 0xDC00, BIT_6);
+                rtl8126_clear_mac_ocp_bit(tp, 0xDC20, BIT_1);
+
+                spin_lock_irqsave(&tp->phy_lock, flags);
+
+                /* Set periodic pulse 1pps */
+                /* E432[8:0] = 0x017d */
+                phy_ocp_data = rtl8126_mdio_direct_read_phy_ocp(tp, 0xE432);
+                phy_ocp_data &= 0xFE00;
+                phy_ocp_data |= 0x017d;
+                rtl8126_mdio_direct_write_phy_ocp(tp, 0xE432, phy_ocp_data);
+
+                rtl8126_mdio_direct_write_phy_ocp(tp, 0xE434, 0x7840);
+
+                /* E436[8:0] = 0xbe */
+                phy_ocp_data = rtl8126_mdio_direct_read_phy_ocp(tp, 0xE436);
+                phy_ocp_data &= 0xFE00;
+                phy_ocp_data |= 0xbe;
+                rtl8126_mdio_direct_write_phy_ocp(tp, 0xE436, phy_ocp_data);
+
+                rtl8126_mdio_direct_write_phy_ocp(tp, 0xE438, 0xbc20);
+
+                spin_unlock_irqrestore(&tp->phy_lock, flags);
+
+                /* start hrtimer */
+                hrtimer_start(&tp->pps_timer, 1000000000, HRTIMER_MODE_REL);
+        } else
+                tp->pps_enable = 0;
 }
 
 static int rtl8126_phc_enable(struct ptp_clock_info *ptp,
                               struct ptp_clock_request *rq, int on)
 {
-        struct rtl8126_private *tp = container_of(ptp, struct rtl8126_private, ptp_clock_info);
-        u16 ptp_ctrl;
-
-        //netif_info(tp, drv, tp->dev, "phc enable type %x on %d\n", rq->type, on);
-
         switch (rq->type) {
         case PTP_CLK_REQ_PPS:
-                rtnl_lock();
-                ptp_ctrl = RTL_R16(tp, PTP_CTRL_8125);
-                ptp_ctrl &= ~BIT_15;
-                if (on)
-                        ptp_ctrl |= BIT_14;
-                else
-                        ptp_ctrl &= ~BIT_14;
-                RTL_W16(tp, PTP_CTRL_8125, ptp_ctrl);
-                rtnl_unlock();
+                _rtl8126_phc_enable(ptp, rq, on);
                 return 0;
         default:
                 return -EOPNOTSUPP;
         }
+}
+
+static void rtl8126_ptp_enable_config(struct rtl8126_private *tp)
+{
+        if (tp->syncE_en)
+                rtl8126_set_eth_phy_ocp_bit(tp, PTP_SYNCE_CTL, BIT_0);
+        else
+                rtl8126_clear_eth_phy_ocp_bit(tp, PTP_SYNCE_CTL, BIT_0);
+
+        rtl8126_mdio_direct_write_phy_ocp(tp, PTP_CTL, PTP_CTL_TYPE_3 | BIT_12);
+
+        rtl8126_set_eth_phy_ocp_bit(tp, 0xA640, BIT_15);
 }
 
 int rtl8126_get_ts_info(struct net_device *netdev,
@@ -311,53 +399,163 @@ static const struct ptp_clock_info rtl_ptp_clock_info = {
         .n_per_out  = 0,
         .n_pins     = 0,
         .pps        = 1,
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6,2,0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,2,0)
+        .adjfine   = rtl8126_ptp_adjfine,
+#else
         .adjfreq    = rtl8126_phc_adjfreq,
-#endif //LINUX_VERSION_CODE < KERNEL_VERSION(6,2,0)
+#endif /* LINUX_VERSION_CODE >= KERNEL_VERSION(6,2,0) */
         .adjtime    = rtl8126_phc_adjtime,
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,0,0)
+        .gettimex64 = rtl8126_phc_gettime,
+#else
         .gettime64  = rtl8126_phc_gettime,
+#endif /* LINUX_VERSION_CODE >= KERNEL_VERSION(5,0,0) */
+
         .settime64  = rtl8126_phc_settime,
         .enable     = rtl8126_phc_enable,
 };
 
-static int rtl8126_ptp_egresstime(struct rtl8126_private *tp, struct timespec64 *ts64, u32 regnum)
+static u16 rtl8126_ptp_get_tx_msgtype(struct rtl8126_private *tp)
 {
+        u16 tx_ts_ready = 0;
+        int i;
+
+        for (i = 0; i < R8126_CHANNEL_WAIT_COUNT; i++) {
+                tx_ts_ready = rtl8126_mdio_direct_read_phy_ocp(tp, PTP_TRX_TS_STA) & 0xF000;
+                if (tx_ts_ready)
+                        break;
+        }
+
+        switch (tx_ts_ready) {
+        case TX_TS_PDLYRSP_RDY:
+                return PTP_MSGTYPE_PDELAY_RESP;
+        case TX_TS_PDLYREQ_RDY:
+                return PTP_MSGTYPE_PDELAY_REQ;
+        case TX_TS_DLYREQ_RDY:
+                return PTP_MSGTYPE_DELAY_REQ;
+        case TX_TS_SYNC_RDY:
+        default:
+                return PTP_MSGTYPE_SYNC;
+        }
+}
+
+/*
+static u16 rtl8126_ptp_get_rx_msgtype(struct rtl8126_private *tp)
+{
+        u16 rx_ts_ready = 0;
+        int i;
+
+        for (i = 0; i < R8126_CHANNEL_WAIT_COUNT; i++) {
+                rx_ts_ready = rtl8126_mdio_direct_read_phy_ocp(tp, PTP_TRX_TS_STA) & 0x0F00;
+                if (rx_ts_ready)
+                        break;
+        }
+
+        switch (rx_ts_ready) {
+        case RX_TS_PDLYRSP_RDY:
+                return PTP_MSGTYPE_PDELAY_RESP;
+        case RX_TS_PDLYREQ_RDY:
+                return PTP_MSGTYPE_PDELAY_REQ;
+        case RX_TS_DLYREQ_RDY:
+                return PTP_MSGTYPE_DELAY_REQ;
+        case RX_TS_SYNC_RDY:
+        default:
+                return PTP_MSGTYPE_SYNC;
+        }
+}
+*/
+
+static void rtl8126_wait_trx_ts_ready(struct rtl8126_private *tp)
+{
+        int i;
+
+        for (i = 0; i < R8126_CHANNEL_WAIT_COUNT; i++)
+                if (!(rtl8126_mdio_direct_read_phy_ocp(tp, PTP_TRX_TS_STA) & TRX_TS_RD))
+                        break;
+}
+
+static void rtl8126_set_trx_ts_cmd(struct rtl8126_private *tp, u16 cmd)
+{
+        rtl8126_clear_and_set_eth_phy_ocp_bit(tp,
+                                              PTP_TRX_TS_STA,
+                                              TRXTS_SEL | BIT_3 | BIT_2,
+                                              TRX_TS_RD | cmd);
+
+        rtl8126_wait_trx_ts_ready(tp);
+}
+
+static void rtl8126_ptp_egresstime(struct rtl8126_private *tp, struct timespec64 *ts64)
+{
+        u16 msgtype;
+
+        msgtype = rtl8126_ptp_get_tx_msgtype(tp);
+
+        msgtype <<= 2;
+
+        rtl8126_set_trx_ts_cmd(tp, (msgtype | BIT_4));
+
         /* nanoseconds */
-        //[29:0]
-        ts64->tv_nsec = rtl8126_mac_ocp_read(tp, PTP_EGRESS_TIME_BASE_NS_8125 + regnum * 16 + 2);
+        //Ns[29:16] E448[13:0]
+        ts64->tv_nsec = rtl8126_mdio_direct_read_phy_ocp(tp, PTP_TRX_TS_NS_HI) & 0x3fff;
         ts64->tv_nsec <<= 16;
-        ts64->tv_nsec |= rtl8126_mac_ocp_read(tp, PTP_EGRESS_TIME_BASE_NS_8125 + regnum * 16);
-        ts64->tv_nsec &= 0x3fffffff;
+        //Ns[15:0]  E446[15:0]
+        ts64->tv_nsec |= rtl8126_mdio_direct_read_phy_ocp(tp, PTP_TRX_TS_NS_LO);
 
         /* seconds */
-        //[47:0]
-        ts64->tv_sec = rtl8126_mac_ocp_read(tp, PTP_EGRESS_TIME_BASE_S_8125 + regnum * 16 + 4);
+        //S[47:32] E44E[15:0]
+        ts64->tv_sec = rtl8126_mdio_direct_read_phy_ocp(tp, PTP_TRX_TS_S_HI);
         ts64->tv_sec <<= 16;
-        ts64->tv_sec |= rtl8126_mac_ocp_read(tp, PTP_EGRESS_TIME_BASE_S_8125 + regnum * 16 + 2);
+        //S[31:16] E44C[15:0]
+        ts64->tv_sec |= rtl8126_mdio_direct_read_phy_ocp(tp, PTP_TRX_TS_S_MI);
         ts64->tv_sec <<= 16;
-        ts64->tv_sec |= rtl8126_mac_ocp_read(tp, PTP_EGRESS_TIME_BASE_S_8125 + regnum * 16);
-        ts64->tv_sec &= 0x0000ffffffffffff;
+        //S[15:0]  E44A[15:0]
+        ts64->tv_sec |= rtl8126_mdio_direct_read_phy_ocp(tp, PTP_TRX_TS_S_LO);
+}
 
-        return 0;
+static void rtl8126_ptp_ingresstime(struct rtl8126_private *tp, struct timespec64 *ts64, u8 type)
+{
+        u16 msgtype;
+
+        switch (type) {
+        case PTP_MSGTYPE_PDELAY_RESP:
+        case PTP_MSGTYPE_PDELAY_REQ:
+        case PTP_MSGTYPE_DELAY_REQ:
+        case PTP_MSGTYPE_SYNC:
+                msgtype = type << 2;
+                break;
+        default:
+                return;
+        }
+
+        rtl8126_set_trx_ts_cmd(tp, (TRXTS_SEL | msgtype | BIT_4));
+
+        /* nanoseconds */
+        //Ns[29:16] E448[13:0]
+        ts64->tv_nsec = rtl8126_mdio_direct_read_phy_ocp(tp, PTP_TRX_TS_NS_HI) & 0x3fff;
+        ts64->tv_nsec <<= 16;
+        //Ns[15:0]  E446[15:0]
+        ts64->tv_nsec |= rtl8126_mdio_direct_read_phy_ocp(tp, PTP_TRX_TS_NS_LO);
+
+        /* seconds */
+        //S[47:32] E44E[15:0]
+        ts64->tv_sec = rtl8126_mdio_direct_read_phy_ocp(tp, PTP_TRX_TS_S_HI);
+        ts64->tv_sec <<= 16;
+        //S[31:16] E44C[15:0]
+        ts64->tv_sec |= rtl8126_mdio_direct_read_phy_ocp(tp, PTP_TRX_TS_S_MI);
+        ts64->tv_sec <<= 16;
+        //S[15:0]  E44A[15:0]
+        ts64->tv_sec |= rtl8126_mdio_direct_read_phy_ocp(tp, PTP_TRX_TS_S_LO);
 }
 
 static void rtl8126_ptp_tx_hwtstamp(struct rtl8126_private *tp)
 {
         struct sk_buff *skb = tp->ptp_tx_skb;
-        struct skb_shared_hwtstamps shhwtstamps = {0};
+        struct skb_shared_hwtstamps shhwtstamps = { 0 };
         struct timespec64 ts64;
-        u32 regnum;
 
-        RTL_W8(tp, PTP_ISR_8125, PTP_ISR_TOK | PTP_ISR_TER);
+        rtl8126_mdio_direct_write_phy_ocp(tp, PTP_INSR, TX_TX_INTR);
 
-        //IO 0x2302 bit 10~11 WR_PTR
-        regnum = RTL_R16(tp, 0x2032) & 0x0C00;
-        regnum >>= 10;
-        regnum = (regnum + 3) % 4;
-
-        rtnl_lock();
-        rtl8126_ptp_egresstime(tp, &ts64, regnum);
-        rtnl_unlock();
+        rtl8126_ptp_egresstime(tp, &ts64);
 
         /* Upper 32 bits contain s, lower 32 bits contain ns. */
         shhwtstamps.hwtstamp = ktime_set(ts64.tv_sec,
@@ -381,6 +579,7 @@ static void rtl8126_ptp_tx_work(struct work_struct *work)
 {
         struct rtl8126_private *tp = container_of(work, struct rtl8126_private,
                                      ptp_tx_work);
+        unsigned long flags;
 
         if (!tp->ptp_tx_skb)
                 return;
@@ -394,45 +593,64 @@ static void rtl8126_ptp_tx_work(struct work_struct *work)
                 /* Clear the tx valid bit in TSYNCTXCTL register to enable
                  * interrupt
                  */
-                RTL_W8(tp, PTP_ISR_8125, PTP_ISR_TOK | PTP_ISR_TER);
+                spin_lock_irqsave(&tp->phy_lock, flags);
+                rtl8126_mdio_direct_write_phy_ocp(tp, PTP_INSR, TX_TX_INTR);
+                spin_unlock_irqrestore(&tp->phy_lock, flags);
                 return;
         }
 
-        if (RTL_R8(tp, PTP_ISR_8125) & (PTP_ISR_TOK))
+        spin_lock_irqsave(&tp->phy_lock, flags);
+        if (rtl8126_mdio_direct_read_phy_ocp(tp, PTP_INSR) & TX_TX_INTR) {
                 rtl8126_ptp_tx_hwtstamp(tp);
-        else
+                spin_unlock_irqrestore(&tp->phy_lock, flags);
+        } else {
+                spin_unlock_irqrestore(&tp->phy_lock, flags);
                 /* reschedule to check later */
                 schedule_work(&tp->ptp_tx_work);
-
+        }
 }
 
 static int rtl8126_hwtstamp_enable(struct rtl8126_private *tp, bool enable)
 {
-        RTL_W16(tp, PTP_CTRL_8125, 0);
+        unsigned long flags;
+
+        spin_lock_irqsave(&tp->phy_lock, flags);
+
         if (enable) {
-                u16 ptp_ctrl;
-                struct timespec64 ts64;
+                //trx timestamp interrupt enable
+                rtl8126_set_eth_phy_ocp_bit(tp, PTP_INER, BIT_2 | BIT_3);
+
+                //set isr clear mode
+                rtl8126_set_eth_phy_ocp_bit(tp, PTP_GEN_CFG, BIT_0);
 
                 //clear ptp isr
-                RTL_W8(tp, PTP_ISR_8125, 0xff);
-                //ptp source 0:gphy 1:mac
-                rtl8126_mac_ocp_write(tp, 0xDC00, rtl8126_mac_ocp_read(tp, 0xDC00) | BIT_6);
-                //enable ptp
-                ptp_ctrl = (BIT_0 | BIT_3 | BIT_4 | BIT_6 | BIT_10 | BIT_12);
-                if (tp->ptp_master_mode)
-                        ptp_ctrl |= BIT_1;
-                RTL_W16(tp, PTP_CTRL_8125, ptp_ctrl);
+                rtl8126_mdio_direct_write_phy_ocp(tp, PTP_INSR, 0xFFFF);
 
-                //set system time
-                /*
-                if (ktime_to_timespec64_cond(ktime_get_real(), &ts64))
-                _rtl8126_phc_settime(tp, timespec64_to_timespec(ts64));
-                */
-                ktime_get_real_ts64(&ts64);
-                _rtl8126_phc_settime(tp, &ts64);
+                //enable ptp
+                rtl8126_ptp_enable_config(tp);
+
+                //rtl8126_set_local_time(tp);
+        } else {
+                /* trx timestamp interrupt disable */
+                rtl8126_clear_eth_phy_ocp_bit(tp, PTP_INER, BIT_2 | BIT_3);
+
+                /* disable ptp */
+                rtl8126_clear_eth_phy_ocp_bit(tp, PTP_SYNCE_CTL, BIT_0);
+                rtl8126_clear_eth_phy_ocp_bit(tp, PTP_CTL, BIT_0);
+                rtl8126_set_eth_phy_ocp_bit(tp, 0xA640, BIT_15);
         }
 
+        spin_unlock_irqrestore(&tp->phy_lock, flags);
+
         return 0;
+}
+
+void rtl8126_set_local_time(struct rtl8126_private *tp)
+{
+        struct timespec64 ts64;
+        //set system time
+        ktime_get_real_ts64(&ts64);
+        _rtl8126_phc_settime(tp, &ts64);
 }
 
 static long rtl8126_ptp_create_clock(struct rtl8126_private *tp)
@@ -449,9 +667,10 @@ static long rtl8126_ptp_create_clock(struct rtl8126_private *tp)
         }
 
         tp->ptp_clock_info = rtl_ptp_clock_info;
+        tp->ptp_clock_info.max_adj = 488281;//0x1FFFFF * 10^9 / 2^32
+
         snprintf(tp->ptp_clock_info.name, sizeof(tp->ptp_clock_info.name),
                  "%pm", tp->dev->dev_addr);
-        tp->ptp_clock_info.max_adj = 119304647;
         tp->ptp_clock = ptp_clock_register(&tp->ptp_clock_info, &tp->pci_dev->dev);
         if (IS_ERR(tp->ptp_clock)) {
                 err = PTR_ERR(tp->ptp_clock);
@@ -462,6 +681,43 @@ static long rtl8126_ptp_create_clock(struct rtl8126_private *tp)
                 netif_info(tp, drv, tp->dev, "registered PHC device on %s\n", netdev->name);
 
         return 0;
+}
+
+static enum hrtimer_restart
+rtl8126_hrtimer_for_pps(struct hrtimer *timer) {
+        struct rtl8126_private *tp = container_of(timer, struct rtl8126_private, pps_timer);
+        u16 tai_cfg = BIT_8 | BIT_3 | BIT_1 | BIT_0;
+        s64 pps_sec;
+
+        if (tp->pps_enable)
+        {
+                unsigned long flags;
+
+                spin_lock_irqsave(&tp->phy_lock, flags);
+
+                //Direct Read
+                rtl8126_set_clkadj_mode(tp, DIRECT_READ);
+
+                pps_sec = rtl8126_mdio_direct_read_phy_ocp(tp, PTP_CFG_S_HI_8126);
+                pps_sec <<= 16;
+                pps_sec |= rtl8126_mdio_direct_read_phy_ocp(tp, PTP_CFG_S_MI_8126);
+                pps_sec <<= 16;
+                pps_sec |= rtl8126_mdio_direct_read_phy_ocp(tp, PTP_CFG_S_LO_8126);
+                pps_sec++;
+
+                //E42A[15:0]
+                rtl8126_mdio_direct_write_phy_ocp(tp, PTP_TAI_TS_S_LO, pps_sec & 0xffff);
+                //E42C[31:16]
+                rtl8126_mdio_direct_write_phy_ocp(tp, PTP_TAI_TS_S_HI, (pps_sec & 0xffff0000) >> 16);
+                //Periodic Tai start
+                rtl8126_mdio_direct_write_phy_ocp(tp, PTP_TAI_CFG, tai_cfg);
+
+                spin_unlock_irqrestore(&tp->phy_lock, flags);
+
+                hrtimer_forward_now(&tp->pps_timer, 1000000000); //rekick
+                return HRTIMER_RESTART;
+        } else
+                return HRTIMER_NORESTART;
 }
 
 void rtl8126_ptp_reset(struct rtl8126_private *tp)
@@ -483,6 +739,11 @@ void rtl8126_ptp_init(struct rtl8126_private *tp)
         /* we have a clock so we can initialize work now */
         INIT_WORK(&tp->ptp_tx_work, rtl8126_ptp_tx_work);
 
+        /* init a hrtimer for pps */
+        tp->pps_enable = 0;
+        hrtimer_init(&tp->pps_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+        tp->pps_timer.function = rtl8126_hrtimer_for_pps;
+
         /* reset the PTP related hardware bits */
         rtl8126_ptp_reset(tp);
 
@@ -500,6 +761,8 @@ void rtl8126_ptp_suspend(struct rtl8126_private *tp)
 
         /* ensure that we cancel any pending PTP Tx work item in progress */
         cancel_work_sync(&tp->ptp_tx_work);
+
+        hrtimer_cancel(&tp->pps_timer);
 }
 
 void rtl8126_ptp_stop(struct rtl8126_private *tp)
@@ -537,6 +800,7 @@ static int rtl8126_set_tstamp(struct net_device *netdev, struct ifreq *ifr)
         switch (config.tx_type) {
         case HWTSTAMP_TX_ON:
                 hwtstamp = 1;
+                break;
         case HWTSTAMP_TX_OFF:
                 break;
         case HWTSTAMP_TX_ONESTEP_SYNC:
@@ -556,15 +820,20 @@ static int rtl8126_set_tstamp(struct net_device *netdev, struct ifreq *ifr)
         case HWTSTAMP_FILTER_PTP_V2_L4_DELAY_REQ:
                 config.rx_filter = HWTSTAMP_FILTER_PTP_V2_EVENT;
                 hwtstamp = 1;
+                tp->flags |= RTL_FLAG_RX_HWTSTAMP_ENABLED;
+                break;
         case HWTSTAMP_FILTER_NONE:
+                tp->flags &= ~RTL_FLAG_RX_HWTSTAMP_ENABLED;
                 break;
         default:
+                tp->flags &= ~RTL_FLAG_RX_HWTSTAMP_ENABLED;
                 return -ERANGE;
         }
 
         if (tp->hwtstamp_config.tx_type != config.tx_type ||
             tp->hwtstamp_config.rx_filter != config.rx_filter) {
                 tp->hwtstamp_config = config;
+
                 rtl8126_hwtstamp_enable(tp, hwtstamp);
         }
 
@@ -605,15 +874,71 @@ int rtl8126_ptp_ioctl(struct net_device *netdev, struct ifreq *ifr, int cmd)
         return ret;
 }
 
-void rtl8126_rx_ptp_pktstamp(struct rtl8126_private *tp, struct sk_buff *skb,
-                             struct RxDescV3 *descv3)
+static void rtl8126_rx_ptp_pktstamp(struct rtl8126_private *tp, struct sk_buff *skb, u8 type)
 {
-        time64_t tv_sec;
-        long tv_nsec;
+        struct timespec64 ts64;
+        unsigned long flags;
 
-        tv_sec = le32_to_cpu(descv3->RxDescTimeStamp.TimeStampHigh) +
-                 ((u64)le32_to_cpu(descv3->RxDescPTPDDWord4.TimeStampHHigh) << 32);
-        tv_nsec = le32_to_cpu(descv3->RxDescTimeStamp.TimeStampLow);
+        spin_lock_irqsave(&tp->phy_lock, flags);
 
-        skb_hwtstamps(skb)->hwtstamp = ktime_set(tv_sec, tv_nsec);
+        rtl8126_ptp_ingresstime(tp, &ts64, type);
+
+        spin_unlock_irqrestore(&tp->phy_lock, flags);
+
+        skb_hwtstamps(skb)->hwtstamp = ktime_set(ts64.tv_sec, ts64.tv_nsec);
+
+        return;
 }
+
+void rtl8126_rx_ptp_timestamp(struct rtl8126_private *tp, struct sk_buff *skb)
+{
+        unsigned int ptp_class;
+        struct ptp_header *hdr;
+        u8 msgtype;
+
+        ptp_class = ptp_classify_raw(skb);
+        if (ptp_class == PTP_CLASS_NONE)
+                return;
+
+        skb_reset_mac_header(skb);
+        hdr = ptp_parse_header(skb, ptp_class);
+        if (unlikely(!hdr))
+                return;
+
+        msgtype = ptp_get_msgtype(hdr, ptp_class);
+        rtl8126_rx_ptp_pktstamp(tp, skb, msgtype);
+
+        return;
+}
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,10,0)
+struct ptp_header *ptp_parse_header(struct sk_buff *skb, unsigned int type)
+{
+        u8 *ptr = skb_mac_header(skb);
+
+        if (type & PTP_CLASS_VLAN)
+                //ptr += VLAN_HLEN;
+                ptr += 4;
+
+        switch (type & PTP_CLASS_PMASK) {
+        case PTP_CLASS_IPV4:
+                ptr += IPV4_HLEN(ptr) + UDP_HLEN;
+                break;
+        case PTP_CLASS_IPV6:
+                ptr += IP6_HLEN + UDP_HLEN;
+                break;
+        case PTP_CLASS_L2:
+                break;
+        default:
+                return NULL;
+        }
+
+        ptr += ETH_HLEN;
+
+        /* Ensure that the entire header is present in this packet. */
+        if (ptr + sizeof(struct ptp_header) > skb->data + skb->len)
+                return NULL;
+
+        return (struct ptp_header *)ptr;
+}
+#endif /* LINUX_VERSION_CODE < KERNEL_VERSION(5,10,0) */

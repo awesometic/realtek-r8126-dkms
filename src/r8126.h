@@ -41,7 +41,12 @@
 #include <linux/version.h>
 #include "r8126_dash.h"
 #include "r8126_realwow.h"
+#ifdef ENABLE_FIBER_SUPPORT
+#include "r8126_fiber.h"
+#endif /* ENABLE_FIBER_SUPPORT */
+#ifdef ENABLE_PTP_SUPPORT
 #include "r8126_ptp.h"
+#endif
 #include "r8126_rss.h"
 #ifdef ENABLE_LIB_SUPPORT
 #include "r8126_lib.h"
@@ -50,6 +55,103 @@
 #ifndef fallthrough
 #define fallthrough
 #endif
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3,3,0)
+#define netif_xmit_stopped netif_tx_queue_stopped
+#endif /* LINUX_VERSION_CODE < KERNEL_VERSION(3,3,0) */
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3,7,0)
+#ifndef MDIO_AN_EEE_ADV_100TX
+#define MDIO_AN_EEE_ADV_100TX	0x0002	/* Advertise 100TX EEE cap */
+#endif
+#ifndef MDIO_AN_EEE_ADV_1000T
+#define MDIO_AN_EEE_ADV_1000T	0x0004	/* Advertise 1000T EEE cap */
+#endif
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3,6,0)
+#define MDIO_EEE_100TX		MDIO_AN_EEE_ADV_100TX	/* 100TX EEE cap */
+#define MDIO_EEE_1000T		MDIO_AN_EEE_ADV_1000T	/* 1000T EEE cap */
+#define MDIO_EEE_10GT		0x0008	/* 10GT EEE cap */
+#define MDIO_EEE_1000KX		0x0010	/* 1000KX EEE cap */
+#define MDIO_EEE_10GKX4		0x0020	/* 10G KX4 EEE cap */
+#define MDIO_EEE_10GKR		0x0040	/* 10G KR EEE cap */
+#endif /* LINUX_VERSION_CODE < KERNEL_VERSION(3,6,0) */
+
+static inline u32 mmd_eee_adv_to_ethtool_adv_t(u16 eee_adv)
+{
+        u32 adv = 0;
+
+        if (eee_adv & MDIO_EEE_100TX)
+                adv |= ADVERTISED_100baseT_Full;
+        if (eee_adv & MDIO_EEE_1000T)
+                adv |= ADVERTISED_1000baseT_Full;
+        if (eee_adv & MDIO_EEE_10GT)
+                adv |= ADVERTISED_10000baseT_Full;
+        if (eee_adv & MDIO_EEE_1000KX)
+                adv |= ADVERTISED_1000baseKX_Full;
+        if (eee_adv & MDIO_EEE_10GKX4)
+                adv |= ADVERTISED_10000baseKX4_Full;
+        if (eee_adv & MDIO_EEE_10GKR)
+                adv |= ADVERTISED_10000baseKR_Full;
+
+        return adv;
+}
+
+static inline u16 ethtool_adv_to_mmd_eee_adv_t(u32 adv)
+{
+        u16 reg = 0;
+
+        if (adv & ADVERTISED_100baseT_Full)
+                reg |= MDIO_EEE_100TX;
+        if (adv & ADVERTISED_1000baseT_Full)
+                reg |= MDIO_EEE_1000T;
+        if (adv & ADVERTISED_10000baseT_Full)
+                reg |= MDIO_EEE_10GT;
+        if (adv & ADVERTISED_1000baseKX_Full)
+                reg |= MDIO_EEE_1000KX;
+        if (adv & ADVERTISED_10000baseKX4_Full)
+                reg |= MDIO_EEE_10GKX4;
+        if (adv & ADVERTISED_10000baseKR_Full)
+                reg |= MDIO_EEE_10GKR;
+
+        return reg;
+}
+#endif /* LINUX_VERSION_CODE < KERNEL_VERSION(3,7,0) */
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3,9,0)
+static inline bool skb_transport_header_was_set(const struct sk_buff *skb)
+{
+        return skb->transport_header != ~0U;
+}
+#endif /* LINUX_VERSION_CODE < KERNEL_VERSION(3,9,0) */
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4,20,0)
+static inline void linkmode_set_bit(int nr, volatile unsigned long *addr)
+{
+        __set_bit(nr, addr);
+}
+
+static inline void linkmode_clear_bit(int nr, volatile unsigned long *addr)
+{
+        __clear_bit(nr, addr);
+}
+
+static inline int linkmode_test_bit(int nr, volatile unsigned long *addr)
+{
+        return test_bit(nr, addr);
+}
+#endif /* LINUX_VERSION_CODE < KERNEL_VERSION(4,20,0) */
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,0,0)
+static inline void linkmode_mod_bit(int nr, volatile unsigned long *addr,
+                                    int set)
+{
+        if (set)
+                linkmode_set_bit(nr, addr);
+        else
+                linkmode_clear_bit(nr, addr);
+}
+#endif /* LINUX_VERSION_CODE < KERNEL_VERSION(5,0,0) */
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4,3,0)
 static inline
@@ -110,11 +212,25 @@ static inline void netdev_tx_reset_queue(struct netdev_queue *q) {}
 #define netif_testing_off(dev)
 #endif
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6,2,0)
+#define netdev_sw_irq_coalesce_default_on(dev)
+#endif /* LINUX_VERSION_CODE < KERNEL_VERSION(6,2,0) */
+
 #if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,32)
 typedef int netdev_tx_t;
 #endif
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5,12,0)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4,1,9)
+static inline bool page_is_pfmemalloc(struct page *page)
+{
+        /*
+         * Page index cannot be this large so this must be
+         * a pfmemalloc page.
+         */
+        return page->index == -1UL;
+}
+#endif /* LINUX_VERSION_CODE < KERNEL_VERSION(4,1,9) */
 static inline bool dev_page_is_reusable(struct page *page)
 {
         return likely(page_to_nid(page) == numa_mem_id() &&
@@ -273,7 +389,7 @@ do { \
 #define ENABLE_R8126_PROCFS
 #endif
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,11,0)
 #define ENABLE_R8126_SYSFS
 #endif
 
@@ -392,6 +508,23 @@ do { \
 #define  MDIO_EEE_5GT  0x0002
 #endif
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6,9,0)
+#define ethtool_keee ethtool_eee
+#define rtl8126_ethtool_adv_to_mmd_eee_adv_cap1_t ethtool_adv_to_mmd_eee_adv_t
+static inline u32 rtl8126_ethtool_adv_to_mmd_eee_adv_cap2_t(u32 adv)
+{
+        u32 result = 0;
+
+        if (adv & SUPPORTED_2500baseX_Full)
+                result |= MDIO_EEE_2_5GT;
+
+        return result;
+}
+#else
+#define rtl8126_ethtool_adv_to_mmd_eee_adv_cap1_t linkmode_to_mii_eee_cap1_t
+#define rtl8126_ethtool_adv_to_mmd_eee_adv_cap2_t linkmode_to_mii_eee_cap2_t
+#endif /* LINUX_VERSION_CODE < KERNEL_VERSION(6,9,0) */
+
 #if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,29)
 #ifdef CONFIG_NET_POLL_CONTROLLER
 #define RTL_NET_POLL_CONTROLLER dev->poll_controller=rtl8126_netpoll
@@ -450,6 +583,16 @@ do { \
 #else
 #define NAPI_SUFFIX ""
 #endif
+#ifdef ENABLE_FIBER_SUPPORT
+#define FIBER_SUFFIX "-FIBER"
+#else
+#define FIBER_SUFFIX ""
+#endif
+#ifdef ENABLE_REALWOW_SUPPORT
+#define REALWOW_SUFFIX "-REALWOW"
+#else
+#define REALWOW_SUFFIX ""
+#endif
 #if defined(ENABLE_DASH_PRINTER_SUPPORT)
 #define DASH_SUFFIX "-PRINTER"
 #elif defined(ENABLE_DASH_SUPPORT)
@@ -476,7 +619,7 @@ do { \
 #define RSS_SUFFIX ""
 #endif
 
-#define RTL8126_VERSION "10.013.00" NAPI_SUFFIX DASH_SUFFIX REALWOW_SUFFIX PTP_SUFFIX RSS_SUFFIX
+#define RTL8126_VERSION "10.014.01" NAPI_SUFFIX DASH_SUFFIX REALWOW_SUFFIX PTP_SUFFIX RSS_SUFFIX
 #define MODULENAME "r8126"
 #define PFX MODULENAME ": "
 
@@ -488,7 +631,7 @@ This is free software, and you are welcome to redistribute it under certain cond
 #ifdef RTL8126_DEBUG
 #define assert(expr) \
         if(!(expr)) {                   \
-            printk( "Assertion failed! %s,%s,%s,line=%d\n", \
+            printk("Assertion failed! %s,%s,%s,line=%d\n", \
             #expr,__FILE__,__FUNCTION__,__LINE__);      \
         }
 #define dprintk(fmt, args...)   do { printk(PFX fmt, ## args); } while (0)
@@ -597,7 +740,9 @@ This is free software, and you are welcome to redistribute it under certain cond
 #endif
 
 #define R8126_MAX_TX_QUEUES (2)
-#define R8126_MAX_RX_QUEUES (4)
+#define R8126_MAX_RX_QUEUES_V2 (4)
+#define R8126_MAX_RX_QUEUES_V3 (16)
+#define R8126_MAX_RX_QUEUES R8126_MAX_RX_QUEUES_V3
 #define R8126_MAX_QUEUES R8126_MAX_RX_QUEUES
 
 #define OCP_STD_PHY_BASE	0xa400
@@ -675,10 +820,15 @@ This is free software, and you are welcome to redistribute it under certain cond
 #define ADVERTISE_1000HALF  0x100
 #endif
 
+#ifndef BIT_ULL
+#define BIT_ULL(nr)		(1ULL << (nr))
+#endif
+
 #ifndef ADVERTISED_2500baseX_Full
 #define ADVERTISED_2500baseX_Full  0x8000
 #endif
-#define RTK_ADVERTISED_5000baseX_Full  BIT(48)
+#define RTK_ADVERTISED_5000baseX_Full  BIT_ULL(48)
+#define RTK_SUPPORTED_5000baseX_Full BIT_ULL(48)
 
 #define RTK_ADVERTISE_2500FULL  0x80
 #define RTK_ADVERTISE_5000FULL  0x100
@@ -723,12 +873,16 @@ This is free software, and you are welcome to redistribute it under certain cond
 #define SPEED_5000		5000
 #endif
 
+#define R8126_LINK_STATE_OFF 0
+#define R8126_LINK_STATE_ON 1
+#define R8126_LINK_STATE_UNKNOWN 2
+
 /*****************************************************************************/
 
 //#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,3)
-#if (( LINUX_VERSION_CODE < KERNEL_VERSION(2,4,27) ) || \
-     (( LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,0) ) && \
-      ( LINUX_VERSION_CODE < KERNEL_VERSION(2,6,3) )))
+#if ((LINUX_VERSION_CODE < KERNEL_VERSION(2,4,27)) || \
+     ((LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,0)) && \
+      (LINUX_VERSION_CODE < KERNEL_VERSION(2,6,3))))
 /* copied from linux kernel 2.6.20 include/linux/netdev.h */
 #define NETDEV_ALIGN        32
 #define NETDEV_ALIGN_CONST  (NETDEV_ALIGN - 1)
@@ -864,7 +1018,7 @@ extern void __chk_io_ptr(void __iomem *);
 
 /*****************************************************************************/
 /* 2.5.28 => 2.4.23 */
-#if ( LINUX_VERSION_CODE < KERNEL_VERSION(2,5,28) )
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(2,5,28))
 
 static inline void _kc_synchronize_irq(void)
 {
@@ -885,12 +1039,12 @@ static inline void _kc_synchronize_irq(void)
 
 /*****************************************************************************/
 /* 2.6.4 => 2.6.0 */
-#if ( LINUX_VERSION_CODE < KERNEL_VERSION(2,6,4) )
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(2,6,4))
 #define MODULE_VERSION(_version) MODULE_INFO(version, _version)
 #endif /* 2.6.4 => 2.6.0 */
 /*****************************************************************************/
 /* 2.6.0 => 2.5.28 */
-#if ( LINUX_VERSION_CODE < KERNEL_VERSION(2,6,0) )
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(2,6,0))
 #define MODULE_INFO(version, _version)
 #ifndef CONFIG_E1000_DISABLE_PACKET_SPLIT
 #define CONFIG_E1000_DISABLE_PACKET_SPLIT 1
@@ -921,13 +1075,13 @@ static inline int _kc_pci_dma_mapping_error(dma_addr_t dma_addr)
 
 /*****************************************************************************/
 /* 2.4.22 => 2.4.17 */
-#if ( LINUX_VERSION_CODE < KERNEL_VERSION(2,4,22) )
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(2,4,22))
 #define pci_name(x) ((x)->slot_name)
 #endif /* 2.4.22 => 2.4.17 */
 
 /*****************************************************************************/
 /* 2.6.5 => 2.6.0 */
-#if ( LINUX_VERSION_CODE < KERNEL_VERSION(2,6,5) )
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(2,6,5))
 #define pci_dma_sync_single_for_cpu pci_dma_sync_single
 #define pci_dma_sync_single_for_device  pci_dma_sync_single_for_cpu
 #endif /* 2.6.5 => 2.6.0 */
@@ -1411,6 +1565,26 @@ enum RTL8126_registers {
         PPS_RISE_TIME_S_8125         = 0x68A4,
         PTP_EGRESS_TIME_BASE_NS_8125 = 0XCF20,
         PTP_EGRESS_TIME_BASE_S_8125  = 0XCF24,
+        PTP_CTL                 = 0xE400,
+        PTP_INER                = 0xE402,
+        PTP_INSR                = 0xE404,
+        PTP_SYNCE_CTL           = 0xE406,
+        PTP_GEN_CFG             = 0xE408,
+        PTP_CLK_CFG_8126        = 0xE410,
+        PTP_CFG_NS_LO_8126      = 0xE412,
+        PTP_CFG_NS_HI_8126      = 0xE414,
+        PTP_CFG_S_LO_8126       = 0xE416,
+        PTP_CFG_S_MI_8126       = 0xE418,
+        PTP_CFG_S_HI_8126       = 0xE41A,
+        PTP_TAI_CFG             = 0xE420,
+        PTP_TAI_TS_S_LO         = 0xE42A,
+        PTP_TAI_TS_S_HI         = 0xE42C,
+        PTP_TRX_TS_STA          = 0xE430,
+        PTP_TRX_TS_NS_LO        = 0xE446,
+        PTP_TRX_TS_NS_HI        = 0xE448,
+        PTP_TRX_TS_S_LO         = 0xE44A,
+        PTP_TRX_TS_S_MI         = 0xE44C,
+        PTP_TRX_TS_S_HI         = 0xE44E,
 
         //TCAM
         TCAM_NOTVALID_ADDR           = 0xA000,
@@ -1451,6 +1625,10 @@ enum RTL8126_register_content {
         RxRUNT_V3 = (1 << 19),
         RxCRC_V3 = (1 << 17),
 
+        RxRES_V4 = (1 << 22),
+        RxRUNT_V4 = (1 << 21),
+        RxCRC_V4 = (1 << 20),
+
         /* ChipCmdBits */
         StopReq  = 0x80,
         CmdReset = 0x10,
@@ -1485,6 +1663,7 @@ enum RTL8126_register_content {
         Reserved2_shift = 13,
         RxCfgDMAShift = 8,
         EnableRxDescV3 = (1 << 24),
+        EnableRxDescV4_1 = (1 << 24),
         EnableOuterVlan = (1 << 23),
         EnableInnerVlan = (1 << 22),
         RxCfg_128_int_en = (1 << 15),
@@ -1690,6 +1869,11 @@ enum _DescStatusBit {
         FirstFrag_V3   = (1 << 25), /* First segment of a packet */
         LastFrag_V3    = (1 << 24), /* Final segment of a packet */
 
+        DescOwn_V4     = (DescOwn), /* Descriptor is owned by NIC */
+        RingEnd_V4     = (RingEnd), /* End of descriptor ring */
+        FirstFrag_V4   = (FirstFrag), /* First segment of a packet */
+        LastFrag_V4    = (LastFrag), /* Final segment of a packet */
+
         /* Tx private */
         /*------ offset 0 of tx descriptor ------*/
         LargeSend   = (1 << 27), /* TCP Large Send Offload (TSO) */
@@ -1748,7 +1932,7 @@ enum _DescStatusBit {
         RxIPF_v3       = (1 << 26), /* IP checksum failed */
         RxUDPF_v3      = (1 << 25), /* UDP/IP checksum failed */
         RxTCPF_v3      = (1 << 24), /* TCP/IP checksum failed */
-        RxSCTPF_v3     = (1 << 23), /* TCP/IP checksum failed */
+        RxSCTPF_v3     = (1 << 23), /* SCTP  checksum failed */
         RxVlanTag_v3   = (RxVlanTag), /* VLAN tag available */
 
         /*@@@@@@ offset 0 of rx descriptor => bits for RTL8125 only     begin @@@@@@*/
@@ -1760,6 +1944,23 @@ enum _DescStatusBit {
         /*@@@@@@ offset 4 of rx descriptor => bits for RTL8125 only     begin @@@@@@*/
         RxV6F_v3       = (RxV6F),
         RxV4F_v3       = (RxV4F),
+        /*@@@@@@ offset 4 of rx descriptor => bits for RTL8125 only     end @@@@@@*/
+
+        RxIPF_v4       = (1 << 17), /* IP checksum failed */
+        RxUDPF_v4      = (1 << 16), /* UDP/IP checksum failed */
+        RxTCPF_v4      = (1 << 15), /* TCP/IP checksum failed */
+        RxSCTPF_v4     = (1 << 19), /* SCTP checksum failed */
+        RxVlanTag_v4   = (RxVlanTag), /* VLAN tag available */
+
+        /*@@@@@@ offset 0 of rx descriptor => bits for RTL8125 only     begin @@@@@@*/
+        RxUDPT_v4      = (1 << 19),
+        RxTCPT_v4      = (1 << 18),
+        RxSCTP_v4      = (1 << 19),
+        /*@@@@@@ offset 0 of rx descriptor => bits for RTL8125 only     end @@@@@@*/
+
+        /*@@@@@@ offset 4 of rx descriptor => bits for RTL8125 only     begin @@@@@@*/
+        RxV6F_v4       = (RxV6F),
+        RxV4F_v4       = (RxV4F),
         /*@@@@@@ offset 4 of rx descriptor => bits for RTL8125 only     end @@@@@@*/
 };
 
@@ -1829,6 +2030,7 @@ enum efuse {
 };
 #define RsvdMask    0x3fffc000
 #define RsvdMaskV3  0x3fff8000
+#define RsvdMaskV4  RsvdMaskV3
 
 struct TxDesc {
         u32 opts1;
@@ -1895,6 +2097,22 @@ struct RxDescV3 {
         };
 };
 
+struct RxDescV4 {
+        union {
+                u64   addr;
+
+                struct {
+                        u32 RSSInfo;
+                        u32 RSSResult;
+                } RxDescNormalDDWord1;
+        };
+
+        struct {
+                u32 opts2;
+                u32 opts1;
+        } RxDescNormalDDWord2;
+};
+
 enum rxdesc_type {
         RXDESC_TYPE_NORMAL=0,
         RXDESC_TYPE_NEXT,
@@ -1914,7 +2132,8 @@ enum rx_desc_ring_type {
 
 enum rx_desc_len {
         RX_DESC_LEN_TYPE_1 = (sizeof(struct RxDesc)),
-        RX_DESC_LEN_TYPE_3 = (sizeof(struct RxDescV3))
+        RX_DESC_LEN_TYPE_3 = (sizeof(struct RxDescV3)),
+        RX_DESC_LEN_TYPE_4 = (sizeof(struct RxDescV4))
 };
 
 struct ring_info {
@@ -2245,6 +2464,22 @@ enum rtl8126_state_t {
         __RTL8126_PTP_TX_IN_PROGRESS,
 };
 
+#define RTL_FLAG_RX_HWTSTAMP_ENABLED BIT_0
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3,6,0)
+struct ethtool_eee {
+        __u32	cmd;
+        __u32	supported;
+        __u32	advertised;
+        __u32	lp_advertised;
+        __u32	eee_active;
+        __u32	eee_enabled;
+        __u32	tx_lpi_enabled;
+        __u32	tx_lpi_timer;
+        __u32	reserved[2];
+};
+#endif /* LINUX_VERSION_CODE < KERNEL_VERSION(3,6,0) */
+
 struct rtl8126_private {
         void __iomem *mmio_addr;    /* memory map physical address */
         struct pci_dev *pci_dev;    /* Index of PCI device */
@@ -2258,6 +2493,7 @@ struct rtl8126_private {
         //struct msix_entry msix_entries[R8126_MAX_MSIX_VEC];
         struct net_device_stats stats;  /* statistics of net device */
         unsigned long state;
+        u32 flags;
 
         u32 msg_enable;
         u32 tx_tcp_csum_cmd;
@@ -2304,8 +2540,8 @@ struct rtl8126_private {
         u16 cp_cmd;
         u32 intr_mask;
         u32 timer_intr_mask;
-        u16 isr_reg[R8126_MAX_QUEUES];
-        u16 imr_reg[R8126_MAX_QUEUES];
+        u16 isr_reg[R8126_MAX_MSIX_VEC];
+        u16 imr_reg[R8126_MAX_MSIX_VEC];
         int phy_auto_nego_reg;
         int phy_1000_ctrl_reg;
         int phy_2500_ctrl_reg;
@@ -2389,7 +2625,6 @@ struct rtl8126_private {
 
         u32 HwFiberModeVer;
         u32 HwFiberStat;
-        u8 HwSwitchMdiToFiber;
 
         u16 NicCustLedValue;
 
@@ -2521,7 +2756,7 @@ struct rtl8126_private {
         //Realwow--------------
 #endif //ENABLE_REALWOW_SUPPORT
 
-        struct ethtool_eee eee;
+        struct ethtool_keee eee;
 
 #ifdef ENABLE_R8126_PROCFS
         //Procfs support
@@ -2534,8 +2769,11 @@ struct rtl8126_private {
         DECLARE_BITMAP(sysfs_flag, R8126_SYSFS_FLAG_MAX);
         u32 testmode;
 #endif
+        u8 HwSuppRxDescType;
         u8 InitRxDescType;
         u16 RxDescLength; //V1 16 Byte V2 32 Bytes
+
+        spinlock_t phy_lock;
 
         u8 HwSuppPtpVer;
         u8 EnablePtp;
@@ -2549,6 +2787,9 @@ struct rtl8126_private {
         unsigned long ptp_tx_start;
         struct ptp_clock_info ptp_clock_info;
         struct ptp_clock *ptp_clock;
+        u8 syncE_en;
+        u8 pps_enable;
+        struct hrtimer pps_timer;
 #endif
 
         u8 HwSuppRssVer;
@@ -2672,7 +2913,7 @@ enum mcfg {
 //Ram Code Version
 #define NIC_RAMCODE_VERSION_CFG_METHOD_1 (0x0023)
 #define NIC_RAMCODE_VERSION_CFG_METHOD_2 (0x0033)
-#define NIC_RAMCODE_VERSION_CFG_METHOD_3 (0x0048)
+#define NIC_RAMCODE_VERSION_CFG_METHOD_3 (0x0060)
 
 //hwoptimize
 #define HW_PATCH_SOC_LAN (BIT_0)
@@ -2713,17 +2954,25 @@ void rtl8126_dash2_disable_rx(struct rtl8126_private *tp);
 void rtl8126_dash2_enable_rx(struct rtl8126_private *tp);
 void rtl8126_hw_disable_mac_mcu_bps(struct net_device *dev);
 void rtl8126_mark_to_asic(struct rtl8126_private *tp, struct RxDesc *desc, u32 rx_buf_sz);
+void rtl8126_mark_as_last_descriptor(struct rtl8126_private *tp, struct RxDesc *desc);
 
 static inline void
 rtl8126_make_unusable_by_asic(struct rtl8126_private *tp,
                               struct RxDesc *desc)
 {
-        if (tp->InitRxDescType == RX_DESC_RING_TYPE_3) {
+        switch (tp->InitRxDescType) {
+        case RX_DESC_RING_TYPE_3:
                 ((struct RxDescV3 *)desc)->addr = RTL8126_MAGIC_NUMBER;
                 ((struct RxDescV3 *)desc)->RxDescNormalDDWord4.opts1 &= ~cpu_to_le32(DescOwn | RsvdMaskV3);
-        } else {
+                break;
+        case RX_DESC_RING_TYPE_4:
+                ((struct RxDescV4 *)desc)->addr = RTL8126_MAGIC_NUMBER;
+                ((struct RxDescV4 *)desc)->RxDescNormalDDWord2.opts1 &= ~cpu_to_le32(DescOwn | RsvdMaskV4);
+                break;
+        default:
                 desc->addr = RTL8126_MAGIC_NUMBER;
                 desc->opts1 &= ~cpu_to_le32(DescOwn | RsvdMask);
+                break;
         }
 }
 
@@ -2764,12 +3013,21 @@ int rtl8126_dump_tally_counter(struct rtl8126_private *tp, dma_addr_t paddr);
 void rtl8126_enable_napi(struct rtl8126_private *tp);
 void _rtl8126_wait_for_quiescence(struct net_device *dev);
 
+void rtl8126_mdio_direct_write_phy_ocp(struct rtl8126_private *tp, u16 RegAddr,u16 value);
+u32 rtl8126_mdio_direct_read_phy_ocp(struct rtl8126_private *tp, u16 RegAddr);
+void rtl8126_clear_and_set_eth_phy_ocp_bit(struct rtl8126_private *tp, u16 addr, u16 clearmask, u16 setmask);
+void rtl8126_clear_eth_phy_ocp_bit(struct rtl8126_private *tp, u16 addr, u16 mask);
+void rtl8126_set_eth_phy_ocp_bit(struct rtl8126_private *tp, u16 addr, u16 mask);
+
+void rtl8126_clear_mac_ocp_bit(struct rtl8126_private *tp, u16 addr, u16 mask);
+void rtl8126_set_mac_ocp_bit(struct rtl8126_private *tp, u16 addr, u16 mask);
+
 #ifndef ENABLE_LIB_SUPPORT
 static inline void rtl8126_lib_reset_prepare(struct rtl8126_private *tp) { }
 static inline void rtl8126_lib_reset_complete(struct rtl8126_private *tp) { }
 #endif
 
-#define HW_SUPPORT_CHECK_PHY_DISABLE_MODE(_M)        ((_M)->HwSuppCheckPhyDisableModeVer > 0 )
+#define HW_SUPPORT_CHECK_PHY_DISABLE_MODE(_M)        ((_M)->HwSuppCheckPhyDisableModeVer > 0)
 #define HW_HAS_WRITE_PHY_MCU_RAM_CODE(_M)        (((_M)->HwHasWrRamCodeToMicroP == TRUE) ? 1 : 0)
 #define HW_SUPPORT_D0_SPEED_UP(_M)        ((_M)->HwSuppD0SpeedUpVer > 0)
 #define HW_SUPPORT_MAC_MCU(_M)        ((_M)->HwSuppMacMcuVer > 0)

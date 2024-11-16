@@ -93,7 +93,7 @@ void rtl8126_eeprom_cleanup(struct rtl8126_private *tp)
         rtl8126_lower_clock(tp, &x);
 }
 
-int rtl8126_eeprom_cmd_done(struct rtl8126_private *tp)
+static int rtl8126_eeprom_cmd_done(struct rtl8126_private *tp)
 {
         u8 x;
         int i;
@@ -123,9 +123,8 @@ u16 rtl8126_eeprom_read_sc(struct rtl8126_private *tp, u16 reg)
         u8 x;
         u16 data;
 
-        if(tp->eeprom_type == EEPROM_TYPE_NONE) {
+        if(tp->eeprom_type == EEPROM_TYPE_NONE)
                 return -1;
-        }
 
         if (tp->eeprom_type==EEPROM_TYPE_93C46)
                 addr_sz = 6;
@@ -157,9 +156,8 @@ void rtl8126_eeprom_write_sc(struct rtl8126_private *tp, u16 reg, u16 data)
         int addr_sz = 6;
         int w_dummy_addr = 4;
 
-        if(tp->eeprom_type == EEPROM_TYPE_NONE) {
-                return ;
-        }
+        if(tp->eeprom_type == EEPROM_TYPE_NONE)
+                return;
 
         if (tp->eeprom_type==EEPROM_TYPE_93C46) {
                 addr_sz = 6;
@@ -178,17 +176,15 @@ void rtl8126_eeprom_write_sc(struct rtl8126_private *tp, u16 reg, u16 data)
 
         rtl8126_shift_out_bits(tp, RTL_EEPROM_ERASE_OPCODE, 3);
         rtl8126_shift_out_bits(tp, reg, addr_sz);
-        if (rtl8126_eeprom_cmd_done(tp) < 0) {
+        if (rtl8126_eeprom_cmd_done(tp) < 0)
                 return;
-        }
         rtl8126_stand_by(tp);
 
         rtl8126_shift_out_bits(tp, RTL_EEPROM_WRITE_OPCODE, 3);
         rtl8126_shift_out_bits(tp, reg, addr_sz);
         rtl8126_shift_out_bits(tp, data, 16);
-        if (rtl8126_eeprom_cmd_done(tp) < 0) {
+        if (rtl8126_eeprom_cmd_done(tp) < 0)
                 return;
-        }
         rtl8126_stand_by(tp);
 
         rtl8126_shift_out_bits(tp, RTL_EEPROM_EWDS_OPCODE, 5);

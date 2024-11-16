@@ -91,8 +91,6 @@ int rtl8126_get_rxnfc(struct net_device *dev, struct ethtool_rxnfc *cmd,
         struct rtl8126_private *tp = netdev_priv(dev);
         int ret = -EOPNOTSUPP;
 
-        netif_info(tp, drv, tp->dev, "rss get rxnfc\n");
-
         if (!(dev->features & NETIF_F_RXHASH))
                 return ret;
 
@@ -158,8 +156,6 @@ static int rtl8126_set_rss_hash_opt(struct rtl8126_private *tp,
                                     struct ethtool_rxnfc *nfc)
 {
         u32 rss_flags = tp->rss_flags;
-
-        netif_info(tp, drv, tp->dev, "rss set hash\n");
 
         /*
          * RSS does not support anything other than hashing
@@ -271,8 +267,6 @@ int rtl8126_set_rxnfc(struct net_device *dev, struct ethtool_rxnfc *cmd)
         struct rtl8126_private *tp = netdev_priv(dev);
         int ret = -EOPNOTSUPP;
 
-        netif_info(tp, drv, tp->dev, "rss set rxnfc\n");
-
         if (!(dev->features & NETIF_F_RXHASH))
                 return ret;
 
@@ -296,8 +290,6 @@ u32 rtl8126_get_rxfh_key_size(struct net_device *dev)
 {
         struct rtl8126_private *tp = netdev_priv(dev);
 
-        netif_info(tp, drv, tp->dev, "rss get key size\n");
-
         if (!(dev->features & NETIF_F_RXHASH))
                 return 0;
 
@@ -307,8 +299,6 @@ u32 rtl8126_get_rxfh_key_size(struct net_device *dev)
 u32 rtl8126_rss_indir_size(struct net_device *dev)
 {
         struct rtl8126_private *tp = netdev_priv(dev);
-
-        netif_info(tp, drv, tp->dev, "rss get indir tbl size\n");
 
         if (!(dev->features & NETIF_F_RXHASH))
                 return 0;
@@ -322,28 +312,6 @@ static void rtl8126_get_reta(struct rtl8126_private *tp, u32 *indir)
 
         for (i = 0; i < reta_size; i++)
                 indir[i] = tp->rss_indir_tbl[i];
-}
-
-int rtl8126_get_rxfh(struct net_device *dev, u32 *indir, u8 *key,
-                     u8 *hfunc)
-{
-        struct rtl8126_private *tp = netdev_priv(dev);
-
-        netif_info(tp, drv, tp->dev, "rss get rxfh\n");
-
-        if (!(dev->features & NETIF_F_RXHASH))
-                return -EOPNOTSUPP;
-
-        if (hfunc)
-                *hfunc = ETH_RSS_HASH_TOP;
-
-        if (indir)
-                rtl8126_get_reta(tp, indir);
-
-        if (key)
-                memcpy(key, tp->rss_key, RTL8126_RSS_KEY_SIZE);
-
-        return 0;
 }
 
 static u32 rtl8126_rss_key_reg(struct rtl8126_private *tp)
@@ -386,14 +354,88 @@ static void rtl8126_store_rss_key(struct rtl8126_private *tp)
                 RTL_W32(tp, rss_key_reg + i, *rss_key++);
 }
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,8,0)
+int rtl8126_get_rxfh(struct net_device *dev, struct ethtool_rxfh_param *rxfh)
+{
+        struct rtl8126_private *tp = netdev_priv(dev);
+
+        if (!(dev->features & NETIF_F_RXHASH))
+                return -EOPNOTSUPP;
+
+        rxfh->hfunc = ETH_RSS_HASH_TOP;
+
+        if (rxfh->indir)
+                rtl8126_get_reta(tp, rxfh->indir);
+
+        if (rxfh->key)
+                memcpy(rxfh->key, tp->rss_key, RTL8126_RSS_KEY_SIZE);
+
+        return 0;
+}
+
+int rtl8126_set_rxfh(struct net_device *dev, struct ethtool_rxfh_param *rxfh,
+                     struct netlink_ext_ack *extack)
+{
+        struct rtl8126_private *tp = netdev_priv(dev);
+        int i;
+        u32 reta_entries = rtl8126_rss_indir_tbl_entries(tp);
+
+        /* We require at least one supported parameter to be changed and no
+         * change in any of the unsupported parameters
+         */
+        if (rxfh->hfunc != ETH_RSS_HASH_NO_CHANGE && rxfh->hfunc != ETH_RSS_HASH_TOP)
+                return -EOPNOTSUPP;
+
+        /* Fill out the redirection table */
+        if (rxfh->indir) {
+                int max_queues = tp->num_rx_rings;
+
+                /* Verify user input. */
+                for (i = 0; i < reta_entries; i++)
+                        if (rxfh->indir[i] >= max_queues)
+                                return -EINVAL;
+
+                for (i = 0; i < reta_entries; i++)
+                        tp->rss_indir_tbl[i] = rxfh->indir[i];
+        }
+
+        /* Fill out the rss hash key */
+        if (rxfh->key)
+                memcpy(tp->rss_key, rxfh->key, RTL8126_RSS_KEY_SIZE);
+
+        rtl8126_store_reta(tp);
+
+        rtl8126_store_rss_key(tp);
+
+        return 0;
+}
+#else
+int rtl8126_get_rxfh(struct net_device *dev, u32 *indir, u8 *key,
+                     u8 *hfunc)
+{
+        struct rtl8126_private *tp = netdev_priv(dev);
+
+        if (!(dev->features & NETIF_F_RXHASH))
+                return -EOPNOTSUPP;
+
+        if (hfunc)
+                *hfunc = ETH_RSS_HASH_TOP;
+
+        if (indir)
+                rtl8126_get_reta(tp, indir);
+
+        if (key)
+                memcpy(key, tp->rss_key, RTL8126_RSS_KEY_SIZE);
+
+        return 0;
+}
+
 int rtl8126_set_rxfh(struct net_device *dev, const u32 *indir,
                      const u8 *key, const u8 hfunc)
 {
         struct rtl8126_private *tp = netdev_priv(dev);
         int i;
         u32 reta_entries = rtl8126_rss_indir_tbl_entries(tp);
-
-        netif_info(tp, drv, tp->dev, "rss set rxfh\n");
 
         /* We require at least one supported parameter to be changed and no
          * change in any of the unsupported parameters
@@ -424,11 +466,19 @@ int rtl8126_set_rxfh(struct net_device *dev, const u32 *indir,
 
         return 0;
 }
+#endif /* LINUX_VERSION_CODE >= KERNEL_VERSION(6,8,0) */
 
 static u32 rtl8126_get_rx_desc_hash(struct rtl8126_private *tp,
-                                    struct RxDescV3 *descv3)
+                                    struct RxDesc *desc)
 {
-        return le32_to_cpu(descv3->RxDescNormalDDWord2.RSSResult);
+        switch (tp->InitRxDescType) {
+        case RX_DESC_RING_TYPE_3:
+                return le32_to_cpu(((struct RxDescV3 *)desc)->RxDescNormalDDWord2.RSSResult);
+        case RX_DESC_RING_TYPE_4:
+                return le32_to_cpu(((struct RxDescV4 *)desc)->RxDescNormalDDWord1.RSSResult);
+        default:
+                return 0;
+        }
 }
 
 #define RXS_8125B_RSS_UDP BIT(9)
@@ -437,9 +487,16 @@ static u32 rtl8126_get_rx_desc_hash(struct rtl8126_private *tp,
 #define RXS_8125_RSS_TCP BIT(13)
 #define RTL8126_RXS_RSS_L3_TYPE_MASK (RXS_8125_RSS_IPV4 | RXS_8125_RSS_IPV6)
 #define RTL8126_RXS_RSS_L4_TYPE_MASK (RXS_8125_RSS_TCP | RXS_8125B_RSS_UDP)
-void rtl8126_rx_hash(struct rtl8126_private *tp,
-                     struct RxDescV3 *descv3,
-                     struct sk_buff *skb)
+
+#define RXS_8125B_RSS_UDP_V4 BIT(27)
+#define RXS_8125_RSS_IPV4_V4 BIT(28)
+#define RXS_8125_RSS_IPV6_V4 BIT(29)
+#define RXS_8125_RSS_TCP_V4 BIT(30)
+#define RTL8126_RXS_RSS_L3_TYPE_MASK_V4 (RXS_8125_RSS_IPV4_V4 | RXS_8125_RSS_IPV6_V4)
+#define RTL8126_RXS_RSS_L4_TYPE_MASK_V4 (RXS_8125_RSS_TCP_V4 | RXS_8125B_RSS_UDP_V4)
+static void rtl8126_rx_hash_v3(struct rtl8126_private *tp,
+                               struct RxDescV3 *descv3,
+                               struct sk_buff *skb)
 {
         u16 rss_header_info;
 
@@ -451,9 +508,44 @@ void rtl8126_rx_hash(struct rtl8126_private *tp,
         if (!(rss_header_info & RTL8126_RXS_RSS_L3_TYPE_MASK))
                 return;
 
-        skb_set_hash(skb, rtl8126_get_rx_desc_hash(tp, descv3),
+        skb_set_hash(skb, rtl8126_get_rx_desc_hash(tp, (struct RxDesc *)descv3),
                      (RTL8126_RXS_RSS_L4_TYPE_MASK & rss_header_info) ?
                      PKT_HASH_TYPE_L4 : PKT_HASH_TYPE_L3);
+}
+
+static void rtl8126_rx_hash_v4(struct rtl8126_private *tp,
+                               struct RxDescV4 *descv4,
+                               struct sk_buff *skb)
+{
+        u32 rss_header_info;
+
+        if (!(tp->dev->features & NETIF_F_RXHASH))
+                return;
+
+        rss_header_info = le32_to_cpu(descv4->RxDescNormalDDWord1.RSSInfo);
+
+        if (!(rss_header_info & RTL8126_RXS_RSS_L3_TYPE_MASK_V4))
+                return;
+
+        skb_set_hash(skb, rtl8126_get_rx_desc_hash(tp, (struct RxDesc *)descv4),
+                     (RTL8126_RXS_RSS_L4_TYPE_MASK_V4 & rss_header_info) ?
+                     PKT_HASH_TYPE_L4 : PKT_HASH_TYPE_L3);
+}
+
+void rtl8126_rx_hash(struct rtl8126_private *tp,
+                     struct RxDesc *desc,
+                     struct sk_buff *skb)
+{
+        switch (tp->InitRxDescType) {
+        case RX_DESC_RING_TYPE_3:
+                rtl8126_rx_hash_v3(tp, (struct RxDescV3 *)desc, skb);
+                break;
+        case RX_DESC_RING_TYPE_4:
+                rtl8126_rx_hash_v4(tp, (struct RxDescV4 *)desc, skb);
+                break;
+        default:
+                return;
+        }
 }
 
 void rtl8126_disable_rss(struct rtl8126_private *tp)
