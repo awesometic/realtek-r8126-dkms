@@ -203,6 +203,18 @@ static inline void netdev_tx_completed_queue(struct netdev_queue *dev_queue,
 static inline void netdev_tx_reset_queue(struct netdev_queue *q) {}
 #endif
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,8,0)
+static inline void fsleep(unsigned long usecs)
+{
+        if (usecs <= 10)
+                udelay(usecs);
+        else if (usecs <= 20000)
+                usleep_range(usecs, 2 * usecs);
+        else
+                msleep(DIV_ROUND_UP(usecs, 1000));
+}
+#endif /* LINUX_VERSION_CODE < KERNEL_VERSION(5,8,0) */
+
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5,2,0)
 #define netdev_xmit_more() (0)
 #endif
@@ -619,7 +631,7 @@ static inline u32 rtl8126_ethtool_adv_to_mmd_eee_adv_cap2_t(u32 adv)
 #define RSS_SUFFIX ""
 #endif
 
-#define RTL8126_VERSION "10.014.01" NAPI_SUFFIX DASH_SUFFIX REALWOW_SUFFIX PTP_SUFFIX RSS_SUFFIX
+#define RTL8126_VERSION "10.015.00" NAPI_SUFFIX DASH_SUFFIX REALWOW_SUFFIX PTP_SUFFIX RSS_SUFFIX
 #define MODULENAME "r8126"
 #define PFX MODULENAME ": "
 
@@ -1637,6 +1649,7 @@ enum RTL8126_register_content {
         RxBufEmpty = 0x01,
 
         /* Cfg9346Bits */
+        Cfg9346_EEM_MASK = 0xC0,
         Cfg9346_Lock = 0x00,
         Cfg9346_Unlock = 0xC0,
         Cfg9346_EEDO = (1 << 0),
@@ -1730,8 +1743,11 @@ enum RTL8126_register_content {
 
         /* rtl8126_PHYstatus */
         PowerSaveStatus = 0x80,
+        _1000bpsL = 0x80000,
         _5000bpsF = 0x1000,
+        _5000bpsL = 0x800,
         _2500bpsF = 0x400,
+        _2500bpsL = 0x200,
         TxFlowCtrl = 0x40,
         RxFlowCtrl = 0x20,
         _1000bpsF = 0x10,
@@ -2169,6 +2185,7 @@ enum r8126_flag {
         R8126_FLAG_TASK_RESET_PENDING,
         R8126_FLAG_TASK_ESD_CHECK_PENDING,
         R8126_FLAG_TASK_LINKCHG_CHECK_PENDING,
+        R8126_FLAG_TASK_LINK_CHECK_PENDING,
         R8126_FLAG_MAX
 };
 
@@ -2579,10 +2596,12 @@ struct rtl8126_private {
         struct work_struct reset_task;
         struct work_struct esd_task;
         struct work_struct linkchg_task;
+        struct work_struct link_task;
 #else
         struct delayed_work reset_task;
         struct delayed_work esd_task;
         struct delayed_work linkchg_task;
+        struct delayed_work link_task;
 #endif
         DECLARE_BITMAP(task_flags, R8126_FLAG_MAX);
         unsigned features;
@@ -2777,7 +2796,6 @@ struct rtl8126_private {
 
         u8 HwSuppPtpVer;
         u8 EnablePtp;
-        u8 ptp_master_mode;
 #ifdef ENABLE_PTP_SUPPORT
         u32 tx_hwtstamp_timeouts;
         u32 tx_hwtstamp_skipped;
@@ -2805,6 +2823,8 @@ struct rtl8126_private {
 
         u8 HwSuppMacMcuVer;
         u16 MacMcuPageSize;
+        u64 hw_mcu_patch_code_ver;
+        u64 bin_mcu_patch_code_ver;
 
         u8 HwSuppTcamVer;
 
