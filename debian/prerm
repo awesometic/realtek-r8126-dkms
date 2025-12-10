@@ -1,7 +1,7 @@
 #!/bin/sh
 
 NAME=realtek-r8126
-VERSION=10.015.00
+VERSION=10.016.00
 
 set -e
 
