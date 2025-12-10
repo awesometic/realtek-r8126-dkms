@@ -5,7 +5,7 @@
 # r8126 is the Linux device driver released for Realtek 5 Gigabit Ethernet
 # controllers with PCI-Express interface.
 #
-# Copyright(c) 2024 Realtek Semiconductor Corp. All rights reserved.
+# Copyright(c) 2025 Realtek Semiconductor Corp. All rights reserved.
 #
 # This program is free software; you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by the Free
@@ -185,8 +185,13 @@ static inline u8 ptp_get_msgtype(const struct ptp_header *hdr,
 struct rtl8126_private;
 struct RxDescV3;
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6,11,0)
 int rtl8126_get_ts_info(struct net_device *netdev,
                         struct ethtool_ts_info *info);
+#else
+int rtl8126_get_ts_info(struct net_device *netdev,
+                        struct kernel_ethtool_ts_info *info);
+#endif /* LINUX_VERSION_CODE < KERNEL_VERSION(6,11,0) */
 
 void rtl8126_ptp_reset(struct rtl8126_private *tp);
 void rtl8126_ptp_init(struct rtl8126_private *tp);

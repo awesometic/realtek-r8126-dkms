@@ -5,7 +5,7 @@
 # r8126 is the Linux device driver released for Realtek 5 Gigabit Ethernet
 # controllers with PCI-Express interface.
 #
-# Copyright(c) 2024 Realtek Semiconductor Corp. All rights reserved.
+# Copyright(c) 2025 Realtek Semiconductor Corp. All rights reserved.
 #
 # This program is free software; you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by the Free
@@ -104,10 +104,10 @@ static int rtl8126_eeprom_cmd_done(struct rtl8126_private *tp)
                 x = RTL_R8(tp, Cfg9346);
 
                 if (x & Cfg9346_EEDO) {
-                        fsleep(RTL_CLOCK_RATE * 2 * 3);
+                        udelay(RTL_CLOCK_RATE * 2 * 3);
                         return 0;
                 }
-                fsleep(1);
+                udelay(1);
         }
 
         return -1;
@@ -198,7 +198,7 @@ void rtl8126_raise_clock(struct rtl8126_private *tp, u8 *x)
 {
         *x = *x | Cfg9346_EESK;
         RTL_W8(tp, Cfg9346, *x);
-        fsleep(RTL_CLOCK_RATE);
+        udelay(RTL_CLOCK_RATE);
 }
 
 void rtl8126_lower_clock(struct rtl8126_private *tp, u8 *x)
@@ -206,7 +206,7 @@ void rtl8126_lower_clock(struct rtl8126_private *tp, u8 *x)
 
         *x = *x & ~Cfg9346_EESK;
         RTL_W8(tp, Cfg9346, *x);
-        fsleep(RTL_CLOCK_RATE);
+        udelay(RTL_CLOCK_RATE);
 }
 
 void rtl8126_shift_out_bits(struct rtl8126_private *tp, int data, int count)
@@ -225,7 +225,7 @@ void rtl8126_shift_out_bits(struct rtl8126_private *tp, int data, int count)
                         x &= ~Cfg9346_EEDI;
 
                 RTL_W8(tp, Cfg9346, x);
-                fsleep(RTL_CLOCK_RATE);
+                udelay(RTL_CLOCK_RATE);
                 rtl8126_raise_clock(tp, &x);
                 rtl8126_lower_clock(tp, &x);
                 mask = mask >> 1;
@@ -268,7 +268,7 @@ void rtl8126_stand_by(struct rtl8126_private *tp)
         x = RTL_R8(tp, Cfg9346);
         x &= ~(Cfg9346_EECS | Cfg9346_EESK);
         RTL_W8(tp, Cfg9346, x);
-        fsleep(RTL_CLOCK_RATE);
+        udelay(RTL_CLOCK_RATE);
 
         x |= Cfg9346_EECS;
         RTL_W8(tp, Cfg9346, x);
@@ -279,7 +279,7 @@ void rtl8126_set_eeprom_sel_low(struct rtl8126_private *tp)
         RTL_W8(tp, Cfg9346, Cfg9346_EEM1);
         RTL_W8(tp, Cfg9346, Cfg9346_EEM1 | Cfg9346_EESK);
 
-        fsleep(20);
+        udelay(20);
 
         RTL_W8(tp, Cfg9346, Cfg9346_EEM1);
 }

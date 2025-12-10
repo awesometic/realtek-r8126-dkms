@@ -5,7 +5,7 @@
 # r8126 is the Linux device driver released for Realtek 5 Gigabit Ethernet
 # controllers with PCI-Express interface.
 #
-# Copyright(c) 2024 Realtek Semiconductor Corp. All rights reserved.
+# Copyright(c) 2025 Realtek Semiconductor Corp. All rights reserved.
 #
 # This program is free software; you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by the Free
@@ -68,7 +68,7 @@ static int _rtl8126_phc_gettime(struct rtl8126_private *tp, struct timespec64 *t
 {
         unsigned long flags;
 
-        spin_lock_irqsave(&tp->phy_lock, flags);
+        r8126_spin_lock(&tp->phy_lock, flags);
 
         //Direct Read
         rtl8126_set_clkadj_mode(tp, DIRECT_READ);
@@ -91,7 +91,7 @@ static int _rtl8126_phc_gettime(struct rtl8126_private *tp, struct timespec64 *t
         //S[15:0]  E416[15:0]
         ts64->tv_sec |= rtl8126_mdio_direct_read_phy_ocp(tp, PTP_CFG_S_LO_8126);
 
-        spin_unlock_irqrestore(&tp->phy_lock, flags);
+        r8126_spin_unlock(&tp->phy_lock, flags);
 
         return 0;
 }
@@ -100,7 +100,7 @@ static int _rtl8126_phc_settime(struct rtl8126_private *tp, const struct timespe
 {
         unsigned long flags;
 
-        spin_lock_irqsave(&tp->phy_lock, flags);
+        r8126_spin_lock(&tp->phy_lock, flags);
 
         /* nanoseconds */
         //Ns[15:0]  E412[15:0]
@@ -119,7 +119,7 @@ static int _rtl8126_phc_settime(struct rtl8126_private *tp, const struct timespe
         //Direct Write
         rtl8126_set_clkadj_mode(tp, DIRECT_WRITE);
 
-        spin_unlock_irqrestore(&tp->phy_lock, flags);
+        r8126_spin_unlock(&tp->phy_lock, flags);
 
         return 0;
 }
@@ -149,7 +149,7 @@ static int _rtl8126_phc_adjtime(struct rtl8126_private *tp, s64 delta)
         nsec &= 0x3fffffff;
         sec &= 0x0000ffffffffffff;
 
-        spin_lock_irqsave(&tp->phy_lock, flags);
+        r8126_spin_lock(&tp->phy_lock, flags);
 
         /* nanoseconds */
         //Ns[15:0]  E412[15:0]
@@ -170,7 +170,7 @@ static int _rtl8126_phc_adjtime(struct rtl8126_private *tp, s64 delta)
         else
                 rtl8126_set_clkadj_mode(tp, INCREMENT_STEP);
 
-        spin_unlock_irqrestore(&tp->phy_lock, flags);
+        r8126_spin_unlock(&tp->phy_lock, flags);
 
         return 0;
 }
@@ -207,7 +207,7 @@ static int _rtl8126_phc_adjfreq(struct ptp_clock_info *ptp, s32 ppb)
         } else
                 rate_value = ((u64)ppb << 32) / 1000000000;
 
-        spin_lock_irqsave(&tp->phy_lock, flags);
+        r8126_spin_lock(&tp->phy_lock, flags);
 
         /* nanoseconds */
         //Ns[15:0]  E412[15:0]
@@ -217,7 +217,7 @@ static int _rtl8126_phc_adjfreq(struct ptp_clock_info *ptp, s32 ppb)
 
         rtl8126_set_clkadj_mode(tp, RATE_WRITE);
 
-        spin_unlock_irqrestore(&tp->phy_lock, flags);
+        r8126_spin_unlock(&tp->phy_lock, flags);
 
         return 0;
 }
@@ -305,7 +305,7 @@ static void _rtl8126_phc_enable(struct ptp_clock_info *ptp,
                 rtl8126_clear_mac_ocp_bit(tp, 0xDC00, BIT_6);
                 rtl8126_clear_mac_ocp_bit(tp, 0xDC20, BIT_1);
 
-                spin_lock_irqsave(&tp->phy_lock, flags);
+                r8126_spin_lock(&tp->phy_lock, flags);
 
                 /* Set periodic pulse 1pps */
                 /* E432[8:0] = 0x017d */
@@ -324,7 +324,7 @@ static void _rtl8126_phc_enable(struct ptp_clock_info *ptp,
 
                 rtl8126_mdio_direct_write_phy_ocp(tp, 0xE438, 0xbc20);
 
-                spin_unlock_irqrestore(&tp->phy_lock, flags);
+                r8126_spin_unlock(&tp->phy_lock, flags);
 
                 /* start hrtimer */
                 hrtimer_start(&tp->pps_timer, 1000000000, HRTIMER_MODE_REL);
@@ -356,8 +356,13 @@ static void rtl8126_ptp_enable_config(struct rtl8126_private *tp)
         rtl8126_set_eth_phy_ocp_bit(tp, 0xA640, BIT_15);
 }
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6,11,0)
 int rtl8126_get_ts_info(struct net_device *netdev,
                         struct ethtool_ts_info *info)
+#else
+int rtl8126_get_ts_info(struct net_device *netdev,
+                        struct kernel_ethtool_ts_info *info)
+#endif /* LINUX_VERSION_CODE < KERNEL_VERSION(6,11,0) */
 {
         struct rtl8126_private *tp = netdev_priv(netdev);
 
@@ -580,6 +585,7 @@ static void rtl8126_ptp_tx_work(struct work_struct *work)
         struct rtl8126_private *tp = container_of(work, struct rtl8126_private,
                                      ptp_tx_work);
         unsigned long flags;
+        bool tx_intr;
 
         if (!tp->ptp_tx_skb)
                 return;
@@ -593,18 +599,22 @@ static void rtl8126_ptp_tx_work(struct work_struct *work)
                 /* Clear the tx valid bit in TSYNCTXCTL register to enable
                  * interrupt
                  */
-                spin_lock_irqsave(&tp->phy_lock, flags);
+                r8126_spin_lock(&tp->phy_lock, flags);
                 rtl8126_mdio_direct_write_phy_ocp(tp, PTP_INSR, TX_TX_INTR);
-                spin_unlock_irqrestore(&tp->phy_lock, flags);
+                r8126_spin_unlock(&tp->phy_lock, flags);
                 return;
         }
 
-        spin_lock_irqsave(&tp->phy_lock, flags);
+        r8126_spin_lock(&tp->phy_lock, flags);
         if (rtl8126_mdio_direct_read_phy_ocp(tp, PTP_INSR) & TX_TX_INTR) {
+                tx_intr = true;
                 rtl8126_ptp_tx_hwtstamp(tp);
-                spin_unlock_irqrestore(&tp->phy_lock, flags);
         } else {
-                spin_unlock_irqrestore(&tp->phy_lock, flags);
+                tx_intr = false;
+        }
+        r8126_spin_unlock(&tp->phy_lock, flags);
+
+        if (!tx_intr) {
                 /* reschedule to check later */
                 schedule_work(&tp->ptp_tx_work);
         }
@@ -614,7 +624,7 @@ static int rtl8126_hwtstamp_enable(struct rtl8126_private *tp, bool enable)
 {
         unsigned long flags;
 
-        spin_lock_irqsave(&tp->phy_lock, flags);
+        r8126_spin_lock(&tp->phy_lock, flags);
 
         if (enable) {
                 //trx timestamp interrupt enable
@@ -640,7 +650,7 @@ static int rtl8126_hwtstamp_enable(struct rtl8126_private *tp, bool enable)
                 rtl8126_set_eth_phy_ocp_bit(tp, 0xA640, BIT_15);
         }
 
-        spin_unlock_irqrestore(&tp->phy_lock, flags);
+        r8126_spin_unlock(&tp->phy_lock, flags);
 
         return 0;
 }
@@ -693,7 +703,7 @@ rtl8126_hrtimer_for_pps(struct hrtimer *timer) {
         {
                 unsigned long flags;
 
-                spin_lock_irqsave(&tp->phy_lock, flags);
+                r8126_spin_lock(&tp->phy_lock, flags);
 
                 //Direct Read
                 rtl8126_set_clkadj_mode(tp, DIRECT_READ);
@@ -712,7 +722,7 @@ rtl8126_hrtimer_for_pps(struct hrtimer *timer) {
                 //Periodic Tai start
                 rtl8126_mdio_direct_write_phy_ocp(tp, PTP_TAI_CFG, tai_cfg);
 
-                spin_unlock_irqrestore(&tp->phy_lock, flags);
+                r8126_spin_unlock(&tp->phy_lock, flags);
 
                 hrtimer_forward_now(&tp->pps_timer, 1000000000); //rekick
                 return HRTIMER_RESTART;
@@ -879,11 +889,11 @@ static void rtl8126_rx_ptp_pktstamp(struct rtl8126_private *tp, struct sk_buff *
         struct timespec64 ts64;
         unsigned long flags;
 
-        spin_lock_irqsave(&tp->phy_lock, flags);
+        r8126_spin_lock(&tp->phy_lock, flags);
 
         rtl8126_ptp_ingresstime(tp, &ts64, type);
 
-        spin_unlock_irqrestore(&tp->phy_lock, flags);
+        r8126_spin_unlock(&tp->phy_lock, flags);
 
         skb_hwtstamps(skb)->hwtstamp = ktime_set(ts64.tv_sec, ts64.tv_nsec);
 

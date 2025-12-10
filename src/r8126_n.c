@@ -5,7 +5,7 @@
 # r8126 is the Linux device driver released for Realtek 5 Gigabit Ethernet
 # controllers with PCI-Express interface.
 #
-# Copyright(c) 2024 Realtek Semiconductor Corp. All rights reserved.
+# Copyright(c) 2025 Realtek Semiconductor Corp. All rights reserved.
 #
 # This program is free software; you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by the Free
@@ -704,6 +704,12 @@ rtl8126_get_sw_tail_ptr(struct rtl8126_tx_ring *ring)
         }
 }
 
+static u32
+rtl8126_get_phy_status(struct rtl8126_private *tp)
+{
+        return RTL_R32(tp, PHYstatus);
+}
+
 static bool
 rtl8126_sysfs_testmode_on(struct rtl8126_private *tp)
 {
@@ -807,10 +813,10 @@ static void rtl8126_get_cp_len(struct rtl8126_private *tp,
                                int cp_len[RTL8126_CP_NUM])
 {
         int i;
-        u16 status;
+        u32 status;
         int tmp_cp_len;
 
-        status = RTL_R16(tp, PHYstatus);
+        status = rtl8126_get_phy_status(tp);
         if (status & LinkStatus) {
                 if (status & _10bps) {
                         tmp_cp_len = -1;
@@ -911,10 +917,10 @@ static void rtl8126_get_cp_status(struct rtl8126_private *tp,
                                   int cp_status[RTL8126_CP_NUM],
                                   bool poe_mode)
 {
-        u16 status;
+        u32 status;
         int i;
 
-        status = RTL_R16(tp, PHYstatus);
+        status = rtl8126_get_phy_status(tp);
         if (status & LinkStatus && !(status & (_10bps | _100bps))) {
                 for (i=0; i<RTL8126_CP_NUM; i++)
                         cp_status[i] = rtl8126_cp_normal;
@@ -1021,9 +1027,6 @@ static int proc_get_driver_variable(struct seq_file *m, void *v)
         seq_printf(m, "HwFiberStat\t0x%x\n", tp->HwFiberStat);
         seq_printf(m, "NicCustLedValue\t0x%x\n", tp->NicCustLedValue);
         seq_printf(m, "RequiredSecLanDonglePatch\t0x%x\n", tp->RequiredSecLanDonglePatch);
-        seq_printf(m, "HwSuppDashVer\t0x%x\n", tp->HwSuppDashVer);
-        seq_printf(m, "DASH\t0x%x\n", tp->DASH);
-        seq_printf(m, "dash_printer_enabled\t0x%x\n", tp->dash_printer_enabled);
         seq_printf(m, "HwSuppKCPOffloadVer\t0x%x\n", tp->HwSuppKCPOffloadVer);
         seq_printf(m, "speed_mode\t0x%x\n", speed_mode);
         seq_printf(m, "duplex_mode\t0x%x\n", duplex_mode);
@@ -1290,7 +1293,7 @@ static int proc_get_eth_phy(struct seq_file *m, void *v)
         seq_puts(m, "\nDump Ethernet PHY\n");
         seq_puts(m, "\nOffset\tValue\n------\t-----\n ");
 
-        spin_lock_irqsave(&tp->phy_lock, flags);
+        r8126_spin_lock(&tp->phy_lock, flags);
 
         seq_puts(m, "\n####################page 0##################\n ");
         rtl8126_mdio_write(tp, 0x1f, 0x0000);
@@ -1342,7 +1345,7 @@ static int proc_get_eth_phy(struct seq_file *m, void *v)
                 seq_printf(m, "%04x ", word_rd);
         }
 
-        spin_unlock_irqrestore(&tp->phy_lock, flags);
+        r8126_spin_unlock(&tp->phy_lock, flags);
 
         seq_putc(m, '\n');
         return 0;
@@ -1414,6 +1417,7 @@ static int proc_get_temperature(struct seq_file *m, void *v)
         struct net_device *dev = m->private;
         struct rtl8126_private *tp = netdev_priv(dev);
         u16 ts_digout, tj, fah;
+        unsigned long flags;
 
         rtnl_lock();
 
@@ -1423,20 +1427,23 @@ static int proc_get_temperature(struct seq_file *m, void *v)
                 return 0;
         }
 
+        r8126_spin_lock(&tp->phy_lock, flags);
+
         netif_testing_on(dev);
         ts_digout = rtl8126_read_thermal_sensor(tp);
         netif_testing_off(dev);
 
+        r8126_spin_unlock(&tp->phy_lock, flags);
+
         rtnl_unlock();
 
-        tj = ts_digout / 2;
         if (ts_digout <= 512) {
                 tj = ts_digout / 2;
                 seq_printf(m, "Cel:%d\n", tj);
                 fah = tj * (9/5) + 32;
                 seq_printf(m, "Fah:%d\n", fah);
         } else {
-                tj = (512 - ((ts_digout / 2) - 512)) / 2;
+                tj = (512 - (ts_digout - 512)) / 2;
                 seq_printf(m, "Cel:-%d\n", tj);
                 fah = tj * (9/5) + 32;
                 seq_printf(m, "Fah:-%d\n", fah);
@@ -1449,12 +1456,13 @@ static int proc_get_temperature(struct seq_file *m, void *v)
 static int _proc_get_cable_info(struct seq_file *m, void *v, bool poe_mode)
 {
         int i;
-        u16 status;
+        u32 status;
         int cp_status[RTL8126_CP_NUM];
         int cp_len[RTL8126_CP_NUM] = {0};
         struct net_device *dev = m->private;
         struct rtl8126_private *tp = netdev_priv(dev);
         const char *pair_str[RTL8126_CP_NUM] = {"1-2", "3-6", "4-5", "7-8"};
+        unsigned long flags;
         int ret;
 
         switch (tp->mcfg) {
@@ -1471,15 +1479,18 @@ static int _proc_get_cable_info(struct seq_file *m, void *v, bool poe_mode)
                 goto error_unlock;
         }
 
+        r8126_spin_lock(&tp->phy_lock, flags);
+
         rtl8126_mdio_write(tp, 0x1F, 0x0000);
         if (rtl8126_mdio_read(tp, MII_BMCR) & BMCR_PDOWN) {
+                r8126_spin_unlock(&tp->phy_lock, flags);
                 ret = -EIO;
                 goto error_unlock;
         }
 
         netif_testing_on(dev);
 
-        status = RTL_R16(tp, PHYstatus);
+        status = rtl8126_get_phy_status(tp);
         if (status & LinkStatus)
                 seq_printf(m, "\nlink speed:%d",
                            rtl8126_convert_link_speed(status));
@@ -1489,6 +1500,8 @@ static int _proc_get_cable_info(struct seq_file *m, void *v, bool poe_mode)
         rtl8126_get_cp_len(tp, cp_len);
 
         rtl8126_get_cp_status(tp, cp_status, poe_mode);
+
+        r8126_spin_unlock(&tp->phy_lock, flags);
 
         seq_puts(m, "\npair\tlength\tstatus   \tpp\n");
 
@@ -1745,9 +1758,6 @@ static int proc_get_driver_variable(char *page, char **start,
                         "HwFiberStat\t0x%x\n"
                         "NicCustLedValue\t0x%x\n"
                         "RequiredSecLanDonglePatch\t0x%x\n"
-                        "HwSuppDashVer\t0x%x\n"
-                        "DASH\t0x%x\n"
-                        "dash_printer_enabled\t0x%x\n"
                         "HwSuppKCPOffloadVer\t0x%x\n"
                         "speed_mode\t0x%x\n"
                         "duplex_mode\t0x%x\n"
@@ -1875,9 +1885,6 @@ static int proc_get_driver_variable(char *page, char **start,
                         tp->HwFiberStat,
                         tp->NicCustLedValue,
                         tp->RequiredSecLanDonglePatch,
-                        tp->HwSuppDashVer,
-                        tp->DASH,
-                        tp->dash_printer_enabled,
                         tp->HwSuppKCPOffloadVer,
                         speed_mode,
                         duplex_mode,
@@ -2231,6 +2238,7 @@ static int proc_get_eth_phy(char *page, char **start,
 {
         struct net_device *dev = data;
         int i, n, max = R8126_PHY_REGS_SIZE/2;
+        unsigned long flags;
         u16 word_rd;
         struct rtl8126_private *tp = netdev_priv(dev);
         int len = 0;
@@ -2239,7 +2247,7 @@ static int proc_get_eth_phy(char *page, char **start,
                         "\nDump Ethernet PHY\n"
                         "Offset\tValue\n------\t-----\n");
 
-        rtnl_lock();
+        r8126_spin_lock(&tp->phy_lock, flags);
 
         len += snprintf(page + len, count - len,
                         "\n####################page 0##################\n");
@@ -2321,7 +2329,7 @@ static int proc_get_eth_phy(char *page, char **start,
                                 word_rd);
         }
 
-        rtnl_unlock();
+        r8126_spin_unlock(&tp->phy_lock, flags);
 
         len += snprintf(page + len, count - len, "\n");
 
@@ -2423,6 +2431,7 @@ static int proc_get_temperature(char *page, char **start,
         struct net_device *dev = data;
         struct rtl8126_private *tp = netdev_priv(dev);
         u16 ts_digout, tj, fah;
+        unsigned long flags;
         int len = 0;
 
         rtnl_lock();
@@ -2433,9 +2442,10 @@ static int proc_get_temperature(char *page, char **start,
                 goto out_unlock;
         }
 
+        r8126_spin_lock(&tp->phy_lock, flags);
         ts_digout = rtl8126_read_thermal_sensor(tp);
+        r8126_spin_unlock(&tp->phy_lock, flags);
 
-        tj = ts_digout / 2;
         if (ts_digout <= 512) {
                 tj = ts_digout / 2;
                 len += snprintf(page + len, count - len,
@@ -2447,7 +2457,7 @@ static int proc_get_temperature(char *page, char **start,
                                 fah);
 
         } else {
-                tj = (512 - ((ts_digout / 2) - 512)) / 2;
+                tj = (512 - (ts_digout - 512)) / 2;
                 len += snprintf(page + len, count - len,
                                 "Cel:-%d\n",
                                 tj);
@@ -2472,20 +2482,21 @@ static int _proc_get_cable_info(char *page, char **start,
                                 bool poe_mode)
 {
         int i;
-        u16 status;
+        u32 status;
         int len = 0;
         struct net_device *dev = data;
         int cp_status[RTL8126_CP_NUM] = {0};
         int cp_len[RTL8126_CP_NUM] = {0};
         struct rtl8126_private *tp = netdev_priv(dev);
         const char *pair_str[RTL8126_CP_NUM] = {"1-2", "3-6", "4-5", "7-8"};
+        unsigned long flags;
 
         switch (tp->mcfg) {
         default:
                 return -EOPNOTSUPP;
         }
 
-        spin_lock_irqsave(&tp->phy_lock, flags);
+        rtnl_lock();
 
         if (!rtl8126_sysfs_testmode_on(tp)) {
                 len += snprintf(page + len, count - len,
@@ -2493,7 +2504,7 @@ static int _proc_get_cable_info(char *page, char **start,
                 goto out_unlock;
         }
 
-        status = RTL_R16(tp, PHYstatus);
+        status = rtl8126_get_phy_status(tp);
         if (status & LinkStatus)
                 len += snprintf(page + len, count - len,
                                 "\nlink speed:%d",
@@ -2502,9 +2513,13 @@ static int _proc_get_cable_info(char *page, char **start,
                 len += snprintf(page + len, count - len,
                                 "\nlink status:off");
 
+        r8126_spin_lock(&tp->phy_lock, flags);
+
         rtl8126_get_cp_len(tp, cp_len);
 
         rtl8126_get_cp_status(tp, cp_status, poe_mode);
+
+        r8126_spin_unlock(&tp->phy_lock, flags);
 
         len += snprintf(page + len, count - len,
                         "\npair\tlength\tstatus   \tpp\n");
@@ -2530,7 +2545,7 @@ static int _proc_get_cable_info(char *page, char **start,
         len += snprintf(page + len, count - len, "\n");
 
 out_unlock:
-        spin_unlock_irqrestore(&tp->phy_lock, flags);
+        rtnl_unlock();
 
         *eof = 1;
         return len;
@@ -3381,269 +3396,6 @@ rtl8126_set_mac_ocp_bit(
                                       mask);
 }
 
-u32 rtl8126_ocp_read_with_oob_base_address(struct rtl8126_private *tp, u16 addr, u8 len, const u32 base_address)
-{
-        return rtl8126_eri_read_with_oob_base_address(tp, addr, len, ERIAR_OOB, base_address);
-}
-
-u32 rtl8126_ocp_read(struct rtl8126_private *tp, u16 addr, u8 len)
-{
-        u32 value = 0;
-
-        if (!tp->AllowAccessDashOcp)
-                return 0xffffffff;
-
-        if (HW_DASH_SUPPORT_TYPE_2(tp))
-                value = rtl8126_ocp_read_with_oob_base_address(tp, addr, len, NO_BASE_ADDRESS);
-        else if (HW_DASH_SUPPORT_TYPE_3(tp))
-                value = rtl8126_ocp_read_with_oob_base_address(tp, addr, len, RTL8168FP_OOBMAC_BASE);
-
-        return value;
-}
-
-u32 rtl8126_ocp_write_with_oob_base_address(struct rtl8126_private *tp, u16 addr, u8 len, u32 value, const u32 base_address)
-{
-        return rtl8126_eri_write_with_oob_base_address(tp, addr, len, value, ERIAR_OOB, base_address);
-}
-
-void rtl8126_ocp_write(struct rtl8126_private *tp, u16 addr, u8 len, u32 value)
-{
-        if (!tp->AllowAccessDashOcp)
-                return;
-
-        if (HW_DASH_SUPPORT_TYPE_2(tp))
-                rtl8126_ocp_write_with_oob_base_address(tp, addr, len, value, NO_BASE_ADDRESS);
-        else if (HW_DASH_SUPPORT_TYPE_3(tp))
-                rtl8126_ocp_write_with_oob_base_address(tp, addr, len, value, RTL8168FP_OOBMAC_BASE);
-}
-
-void rtl8126_oob_mutex_lock(struct rtl8126_private *tp)
-{
-        u8 reg_16, reg_a0;
-        u32 wait_cnt_0, wait_Cnt_1;
-        u16 ocp_reg_mutex_ib;
-        u16 ocp_reg_mutex_oob;
-        u16 ocp_reg_mutex_prio;
-
-        if (!tp->DASH)
-                return;
-
-        switch (tp->mcfg) {
-        default:
-                return;
-        }
-
-        rtl8126_ocp_write(tp, ocp_reg_mutex_ib, 1, BIT_0);
-        reg_16 = rtl8126_ocp_read(tp, ocp_reg_mutex_oob, 1);
-        wait_cnt_0 = 0;
-        while(reg_16) {
-                reg_a0 = rtl8126_ocp_read(tp, ocp_reg_mutex_prio, 1);
-                if (reg_a0) {
-                        rtl8126_ocp_write(tp, ocp_reg_mutex_ib, 1, 0x00);
-                        reg_a0 = rtl8126_ocp_read(tp, ocp_reg_mutex_prio, 1);
-                        wait_Cnt_1 = 0;
-                        while(reg_a0) {
-                                reg_a0 = rtl8126_ocp_read(tp, ocp_reg_mutex_prio, 1);
-
-                                wait_Cnt_1++;
-
-                                if (wait_Cnt_1 > 2000)
-                                        break;
-                        };
-                        rtl8126_ocp_write(tp, ocp_reg_mutex_ib, 1, BIT_0);
-
-                }
-                reg_16 = rtl8126_ocp_read(tp, ocp_reg_mutex_oob, 1);
-
-                wait_cnt_0++;
-
-                if (wait_cnt_0 > 2000)
-                        break;
-        };
-}
-
-void rtl8126_oob_mutex_unlock(struct rtl8126_private *tp)
-{
-        //u16 ocp_reg_mutex_ib;
-        //u16 ocp_reg_mutex_oob;
-        //u16 ocp_reg_mutex_prio;
-
-        if (!tp->DASH)
-                return;
-
-        switch (tp->mcfg) {
-        default:
-                return;
-        }
-
-        //rtl8126_ocp_write(tp, ocp_reg_mutex_prio, 1, BIT_0);
-        //rtl8126_ocp_write(tp, ocp_reg_mutex_ib, 1, 0x00);
-}
-
-static bool
-rtl8126_is_allow_access_dash_ocp(struct rtl8126_private *tp)
-{
-        bool allow_access = false;
-
-        if (!HW_DASH_SUPPORT_DASH(tp))
-                goto exit;
-
-        allow_access = true;
-        switch (tp->mcfg) {
-        default:
-                goto exit;
-        }
-exit:
-        return allow_access;
-}
-
-static int rtl8126_check_dash(struct rtl8126_private *tp)
-{
-        if (!tp->AllowAccessDashOcp)
-                return 0;
-
-        if (HW_DASH_SUPPORT_TYPE_2(tp) || HW_DASH_SUPPORT_TYPE_3(tp)) {
-                if (rtl8126_ocp_read(tp, 0x128, 1) & BIT_0)
-                        return 1;
-        }
-
-        return 0;
-}
-
-void rtl8126_dash2_disable_tx(struct rtl8126_private *tp)
-{
-        if (!tp->DASH)
-                return;
-
-        if (HW_DASH_SUPPORT_TYPE_2(tp) || HW_DASH_SUPPORT_TYPE_3(tp)) {
-                u16 WaitCnt;
-                u8 TmpUchar;
-
-                //Disable oob Tx
-                RTL_CMAC_W8(tp, CMAC_IBCR2, RTL_CMAC_R8(tp, CMAC_IBCR2) & ~(BIT_0));
-                WaitCnt = 0;
-
-                //wait oob tx disable
-                do {
-                        TmpUchar = RTL_CMAC_R8(tp, CMAC_IBISR0);
-
-                        if (TmpUchar & ISRIMR_DASH_TYPE2_TX_DISABLE_IDLE) {
-                                break;
-                        }
-
-                        fsleep(50);
-                        WaitCnt++;
-                } while(WaitCnt < 2000);
-
-                //Clear ISRIMR_DASH_TYPE2_TX_DISABLE_IDLE
-                RTL_CMAC_W8(tp, CMAC_IBISR0, RTL_CMAC_R8(tp, CMAC_IBISR0) | ISRIMR_DASH_TYPE2_TX_DISABLE_IDLE);
-        }
-}
-
-void rtl8126_dash2_enable_tx(struct rtl8126_private *tp)
-{
-        if (!tp->DASH)
-                return;
-
-        if (HW_DASH_SUPPORT_TYPE_2(tp) || HW_DASH_SUPPORT_TYPE_3(tp))
-                RTL_CMAC_W8(tp, CMAC_IBCR2, RTL_CMAC_R8(tp, CMAC_IBCR2) | BIT_0);
-}
-
-void rtl8126_dash2_disable_rx(struct rtl8126_private *tp)
-{
-        if (!tp->DASH)
-                return;
-
-        if (HW_DASH_SUPPORT_TYPE_2(tp) || HW_DASH_SUPPORT_TYPE_3(tp))
-                RTL_CMAC_W8(tp, CMAC_IBCR0, RTL_CMAC_R8(tp, CMAC_IBCR0) & ~(BIT_0));
-}
-
-void rtl8126_dash2_enable_rx(struct rtl8126_private *tp)
-{
-        if (!tp->DASH)
-                return;
-
-        if (HW_DASH_SUPPORT_TYPE_2(tp) || HW_DASH_SUPPORT_TYPE_3(tp))
-                RTL_CMAC_W8(tp, CMAC_IBCR0, RTL_CMAC_R8(tp, CMAC_IBCR0) | BIT_0);
-}
-
-static void rtl8126_dash2_disable_txrx(struct net_device *dev)
-{
-        struct rtl8126_private *tp = netdev_priv(dev);
-
-        if (HW_DASH_SUPPORT_TYPE_2(tp) || HW_DASH_SUPPORT_TYPE_3(tp)) {
-                rtl8126_dash2_disable_tx(tp);
-                rtl8126_dash2_disable_rx(tp);
-        }
-}
-
-static int rtl8126_wait_dash_fw_ready(struct rtl8126_private *tp)
-{
-        int rc = -1;
-        int timeout;
-
-        if (HW_DASH_SUPPORT_TYPE_2(tp) == FALSE &&
-            HW_DASH_SUPPORT_TYPE_3(tp) == FALSE)
-                goto out;
-
-        if (!tp->DASH)
-                goto out;
-
-        for (timeout = 0; timeout < 10; timeout++) {
-                fsleep(10000);
-                if (rtl8126_ocp_read(tp, 0x124, 1) & BIT_0) {
-                        rc = 1;
-                        goto out;
-                }
-        }
-
-        rc = 0;
-
-out:
-        return rc;
-}
-
-static void rtl8126_driver_start(struct rtl8126_private *tp)
-{
-        u32 tmp_value;
-
-        if (HW_DASH_SUPPORT_TYPE_2(tp) == FALSE &&
-            HW_DASH_SUPPORT_TYPE_3(tp) == FALSE)
-                return;
-
-        if (!tp->AllowAccessDashOcp)
-                return;
-
-        rtl8126_ocp_write(tp, 0x180, 1, OOB_CMD_DRIVER_START);
-        tmp_value = rtl8126_ocp_read(tp, 0x30, 1);
-        tmp_value |= BIT_0;
-        rtl8126_ocp_write(tp, 0x30, 1, tmp_value);
-
-        rtl8126_wait_dash_fw_ready(tp);
-}
-
-static void rtl8126_driver_stop(struct rtl8126_private *tp)
-{
-        u32 tmp_value;
-        struct net_device *dev = tp->dev;
-
-        if (HW_DASH_SUPPORT_TYPE_2(tp) == FALSE &&
-            HW_DASH_SUPPORT_TYPE_3(tp) == FALSE)
-                return;
-
-        if (!tp->AllowAccessDashOcp)
-                return;
-
-        rtl8126_dash2_disable_txrx(dev);
-
-        rtl8126_ocp_write(tp, 0x180, 1, OOB_CMD_DRIVER_STOP);
-        tmp_value = rtl8126_ocp_read(tp, 0x30, 1);
-        tmp_value |= BIT_0;
-        rtl8126_ocp_write(tp, 0x30, 1, tmp_value);
-
-        rtl8126_wait_dash_fw_ready(tp);
-}
-
 void rtl8126_ephy_write(struct rtl8126_private *tp, int RegAddr, int value)
 {
         int i;
@@ -3654,14 +3406,14 @@ void rtl8126_ephy_write(struct rtl8126_private *tp, int RegAddr, int value)
                 (value & EPHYAR_Data_Mask));
 
         for (i = 0; i < R8126_CHANNEL_WAIT_COUNT; i++) {
-                fsleep(R8126_CHANNEL_WAIT_TIME);
+                udelay(R8126_CHANNEL_WAIT_TIME);
 
                 /* Check if the RTL8125 has completed EPHY write */
                 if (!(RTL_R32(tp, EPHYAR) & EPHYAR_Flag))
                         break;
         }
 
-        fsleep(R8126_CHANNEL_EXIT_DELAY_TIME);
+        udelay(R8126_CHANNEL_EXIT_DELAY_TIME);
 }
 
 u16 rtl8126_ephy_read(struct rtl8126_private *tp, int RegAddr)
@@ -3673,7 +3425,7 @@ u16 rtl8126_ephy_read(struct rtl8126_private *tp, int RegAddr)
                 EPHYAR_Read | (RegAddr & EPHYAR_Reg_Mask_v2) << EPHYAR_Reg_shift);
 
         for (i = 0; i < R8126_CHANNEL_WAIT_COUNT; i++) {
-                fsleep(R8126_CHANNEL_WAIT_TIME);
+                udelay(R8126_CHANNEL_WAIT_TIME);
 
                 /* Check if the RTL8125 has completed EPHY read */
                 if (RTL_R32(tp, EPHYAR) & EPHYAR_Flag) {
@@ -3682,7 +3434,7 @@ u16 rtl8126_ephy_read(struct rtl8126_private *tp, int RegAddr)
                 }
         }
 
-        fsleep(R8126_CHANNEL_EXIT_DELAY_TIME);
+        udelay(R8126_CHANNEL_EXIT_DELAY_TIME);
 
         return value;
 }
@@ -3737,7 +3489,7 @@ rtl8126_csi_other_fun_read(struct rtl8126_private *tp,
         RTL_W32(tp, CSIAR, cmd);
 
         for (i = 0; i < R8126_CHANNEL_WAIT_COUNT; i++) {
-                fsleep(R8126_CHANNEL_WAIT_TIME);
+                udelay(R8126_CHANNEL_WAIT_TIME);
 
                 /* Check if the RTL8125 has completed CSI read */
                 if (RTL_R32(tp, CSIAR) & CSIAR_Flag) {
@@ -3746,7 +3498,7 @@ rtl8126_csi_other_fun_read(struct rtl8126_private *tp,
                 }
         }
 
-        fsleep(R8126_CHANNEL_EXIT_DELAY_TIME);
+        udelay(R8126_CHANNEL_EXIT_DELAY_TIME);
 
 exit:
         return value;
@@ -3774,14 +3526,14 @@ rtl8126_csi_other_fun_write(struct rtl8126_private *tp,
         RTL_W32(tp, CSIAR, cmd);
 
         for (i = 0; i < R8126_CHANNEL_WAIT_COUNT; i++) {
-                fsleep(R8126_CHANNEL_WAIT_TIME);
+                udelay(R8126_CHANNEL_WAIT_TIME);
 
                 /* Check if the RTL8125 has completed CSI write */
                 if (!(RTL_R32(tp, CSIAR) & CSIAR_Flag))
                         break;
         }
 
-        fsleep(R8126_CHANNEL_EXIT_DELAY_TIME);
+        udelay(R8126_CHANNEL_EXIT_DELAY_TIME);
 }
 
 static u32
@@ -3829,7 +3581,7 @@ rtl8126_csi_fun0_read_byte(struct rtl8126_private *tp,
                 RetVal = (u8)TmpUlong;
         }
 
-        fsleep(R8126_CHANNEL_EXIT_DELAY_TIME);
+        udelay(R8126_CHANNEL_EXIT_DELAY_TIME);
 
         return RetVal;
 }
@@ -3856,7 +3608,7 @@ rtl8126_csi_fun0_write_byte(struct rtl8126_private *tp,
                 rtl8126_csi_other_fun_write(tp, 0, RegAlignAddr, TmpUlong);
         }
 
-        fsleep(R8126_CHANNEL_EXIT_DELAY_TIME);
+        udelay(R8126_CHANNEL_EXIT_DELAY_TIME);
 }
 
 u32 rtl8126_eri_read_with_oob_base_address(struct rtl8126_private *tp, int addr, int len, int type, const u32 base_address)
@@ -3889,7 +3641,7 @@ u32 rtl8126_eri_read_with_oob_base_address(struct rtl8126_private *tp, int addr,
                 RTL_W32(tp, ERIAR, eri_cmd);
 
                 for (i = 0; i < R8126_CHANNEL_WAIT_COUNT; i++) {
-                        fsleep(R8126_CHANNEL_WAIT_TIME);
+                        udelay(R8126_CHANNEL_WAIT_TIME);
 
                         /* Check if the RTL8125 has completed ERI read */
                         if (RTL_R32(tp, ERIAR) & ERIAR_Flag)
@@ -3913,7 +3665,7 @@ u32 rtl8126_eri_read_with_oob_base_address(struct rtl8126_private *tp, int addr,
                 }
         }
 
-        fsleep(R8126_CHANNEL_EXIT_DELAY_TIME);
+        udelay(R8126_CHANNEL_EXIT_DELAY_TIME);
 
         return value2;
 }
@@ -3963,7 +3715,7 @@ int rtl8126_eri_write_with_oob_base_address(struct rtl8126_private *tp, int addr
                 RTL_W32(tp, ERIAR, eri_cmd);
 
                 for (i = 0; i < R8126_CHANNEL_WAIT_COUNT; i++) {
-                        fsleep(R8126_CHANNEL_WAIT_TIME);
+                        udelay(R8126_CHANNEL_WAIT_TIME);
 
                         /* Check if the RTL8125 has completed ERI write */
                         if (!(RTL_R32(tp, ERIAR) & ERIAR_Flag))
@@ -3979,13 +3731,14 @@ int rtl8126_eri_write_with_oob_base_address(struct rtl8126_private *tp, int addr
                 }
         }
 
-        fsleep(R8126_CHANNEL_EXIT_DELAY_TIME);
+        udelay(R8126_CHANNEL_EXIT_DELAY_TIME);
 
         return 0;
 }
 
 int rtl8126_eri_write(struct rtl8126_private *tp, int addr, int len, u32 value, int type)
 {
+#define NO_BASE_ADDRESS 0x00000000
         return rtl8126_eri_write_with_oob_base_address(tp, addr, len, value, type, NO_BASE_ADDRESS);
 }
 
@@ -4063,7 +3816,7 @@ rtl8126_stop_all_request(struct net_device *dev)
         struct rtl8126_private *tp = netdev_priv(dev);
 
         RTL_W8(tp, ChipCmd, RTL_R8(tp, ChipCmd) | StopReq);
-        fsleep(200);
+        udelay(200);
 }
 
 static void
@@ -4082,40 +3835,17 @@ rtl8126_wait_txrx_fifo_empty(struct net_device *dev)
 
         /* Txfifo_empty require StopReq been set */
         for (i = 0; i < 3000; i++) {
-                fsleep(50);
+                udelay(50);
                 if ((RTL_R8(tp, MCUCmd_reg) & (Txfifo_empty | Rxfifo_empty)) == (Txfifo_empty | Rxfifo_empty))
                         break;
         }
 
         for (i = 0; i < 3000; i++) {
-                fsleep(50);
+                udelay(50);
                 if ((RTL_R16(tp, IntrMitigate) & (BIT_0 | BIT_1 | BIT_8)) == (BIT_0 | BIT_1 | BIT_8))
                         break;
         }
 }
-
-#ifdef ENABLE_DASH_SUPPORT
-
-static inline void
-rtl8126_enable_dash2_interrupt(struct rtl8126_private *tp)
-{
-        if (!tp->DASH)
-                return;
-
-        if (HW_DASH_SUPPORT_TYPE_2(tp) || HW_DASH_SUPPORT_TYPE_3(tp))
-                RTL_CMAC_W8(tp, CMAC_IBIMR0, (ISRIMR_DASH_TYPE2_ROK | ISRIMR_DASH_TYPE2_TOK | ISRIMR_DASH_TYPE2_TDU | ISRIMR_DASH_TYPE2_RDU | ISRIMR_DASH_TYPE2_RX_DISABLE_IDLE));
-}
-
-static inline void
-rtl8126_disable_dash2_interrupt(struct rtl8126_private *tp)
-{
-        if (!tp->DASH)
-                return;
-
-        if (HW_DASH_SUPPORT_TYPE_2(tp) || HW_DASH_SUPPORT_TYPE_3(tp))
-                RTL_CMAC_W8(tp, CMAC_IBIMR0, 0);
-}
-#endif
 
 void
 rtl8126_enable_hw_linkchg_interrupt(struct rtl8126_private *tp)
@@ -4135,11 +3865,6 @@ rtl8126_enable_hw_linkchg_interrupt(struct rtl8126_private *tp)
                 RTL_W32(tp, tp->imr_reg[0], LinkChg | RTL_R32(tp, tp->imr_reg[0]));
                 break;
         }
-
-#ifdef ENABLE_DASH_SUPPORT
-        if (tp->DASH)
-                rtl8126_enable_dash2_interrupt(tp);
-#endif
 }
 
 static inline void
@@ -4162,11 +3887,6 @@ rtl8126_enable_hw_interrupt(struct rtl8126_private *tp)
                 }
                 break;
         }
-
-#ifdef ENABLE_DASH_SUPPORT
-        if (tp->DASH)
-                rtl8126_enable_dash2_interrupt(tp);
-#endif
 }
 
 static inline void rtl8126_clear_hw_isr_v2(struct rtl8126_private *tp,
@@ -4190,11 +3910,6 @@ rtl8126_disable_hw_interrupt(struct rtl8126_private *tp)
                         for (i=1; i<tp->num_rx_rings; i++)
                                 RTL_W16(tp, tp->imr_reg[i], 0);
                 }
-
-#ifdef ENABLE_DASH_SUPPORT
-                if (tp->DASH)
-                        rtl8126_disable_dash2_interrupt(tp);
-#endif
         }
 }
 
@@ -4213,11 +3928,6 @@ rtl8126_switch_to_timer_interrupt(struct rtl8126_private *tp)
                 RTL_W32(tp, TIMER_INT0_8125, timer_count);
                 RTL_W32(tp, TCTR0_8125, timer_count);
                 RTL_W32(tp, tp->imr_reg[0], tp->timer_intr_mask);
-
-#ifdef ENABLE_DASH_SUPPORT
-                if (tp->DASH)
-                        rtl8126_enable_dash2_interrupt(tp);
-#endif
         } else {
                 rtl8126_switch_to_hw_interrupt(tp);
         }
@@ -4233,22 +3943,7 @@ rtl8126_irq_mask_and_ack(struct rtl8126_private *tp)
                 if (tp->HwCurrIsrVer > 3)
                         RTL_W32(tp, ISR_V4_L2_8125, 0xFFFFFFFF);
         } else {
-#ifdef ENABLE_DASH_SUPPORT
-                if (tp->DASH) {
-                        if (tp->dash_printer_enabled) {
-                                RTL_W32(tp, tp->isr_reg[0], RTL_R32(tp, tp->isr_reg[0]) &
-                                        ~(ISRIMR_DASH_INTR_EN | ISRIMR_DASH_INTR_CMAC_RESET));
-                        } else {
-                                if (HW_DASH_SUPPORT_TYPE_2(tp) || HW_DASH_SUPPORT_TYPE_3(tp)) {
-                                        RTL_CMAC_W8(tp, CMAC_IBISR0, RTL_CMAC_R8(tp, CMAC_IBISR0));
-                                }
-                        }
-                } else {
-                        RTL_W32(tp, tp->isr_reg[0], RTL_R32(tp, tp->isr_reg[0]));
-                }
-#else
                 RTL_W32(tp, tp->isr_reg[0], RTL_R32(tp, tp->isr_reg[0]));
-#endif
                 if (R8126_MULTI_RX_Q(tp)) {
                         int i;
                         for (i=1; i<tp->num_rx_rings; i++)
@@ -4287,7 +3982,7 @@ rtl8126_nic_reset(struct net_device *dev)
 
         /* Check that the chip has finished the reset. */
         for (i = 100; i > 0; i--) {
-                fsleep(100);
+                udelay(100);
                 if ((RTL_R8(tp, ChipCmd) & CmdReset) == 0)
                         break;
         }
@@ -4368,35 +4063,105 @@ rtl8126_hw_clear_int_miti(struct net_device *dev)
         }
 }
 
-void
-rtl8126_hw_set_timer_int_8125(struct rtl8126_private *tp,
-                              u32 message_id,
-                              u8 timer_intmiti_val)
+static bool
+rtl8126_vec_2_tx_q_num(
+        struct rtl8126_private *tp,
+        u32 messageId,
+        u32 *qnum
+)
 {
-        switch (tp->HwSuppIntMitiVer) {
+        u32 whichQ = 0xffffffff;
+        bool rc = false;
+
+        switch (tp->HwSuppIsrVer) {
+        case 2:
+                if (messageId == 0x10)
+                        whichQ = 0;
+                else if (messageId == 0x12 && tp->num_tx_rings > 1)
+                        whichQ = 1;
+                break;
+        case 3:
         case 4:
-#ifdef ENABLE_LIB_SUPPORT
-                if (message_id < R8126_MAX_RX_QUEUES_VEC_V3)
-                        timer_intmiti_val = 0;
-#else
-                if ((tp->HwCurrIsrVer == 2) && (message_id < R8126_MAX_RX_QUEUES_VEC_V3))
-                        timer_intmiti_val = 0;
-#endif //ENABLE_LIB_SUPPORT
-                if (message_id < R8126_MAX_RX_QUEUES_VEC_V3) //ROK
-                        RTL_W8(tp,INT_MITI_V2_0_RX + 8 * message_id, timer_intmiti_val);
-                if (message_id == 16) //TOK
-                        RTL_W8(tp,INT_MITI_V2_0_TX, timer_intmiti_val);
-                if (message_id == 18 && tp->num_tx_rings > 0) //TOK
-                        RTL_W8(tp,INT_MITI_V2_1_TX, timer_intmiti_val);
+                if (messageId == 0x00)
+                        whichQ = 0;
+                else if (messageId == 0x01 && tp->num_tx_rings > 1)
+                        whichQ = 1;
                 break;
         case 5:
+                if (messageId == 0x10)
+                        whichQ = 0;
+                else if (messageId == 0x11 && tp->num_tx_rings > 1)
+                        whichQ = 1;
+                break;
         case 6:
-                if (message_id < R8126_MAX_RX_QUEUES_VEC_V3) //ROK
-                        RTL_W8(tp,INT_MITI_V2_0_RX + 8 * message_id, timer_intmiti_val);
-                if (message_id == 0) //TOK
-                        RTL_W8(tp,INT_MITI_V2_0_TX, timer_intmiti_val);
-                if (message_id == 1 && tp->num_tx_rings > 0) //TOK
-                        RTL_W8(tp,INT_MITI_V2_1_TX, timer_intmiti_val);
+                if (messageId == 0x08)
+                        whichQ = 0;
+                else if (messageId == 0x09 && tp->num_tx_rings > 1)
+                        whichQ = 1;
+                break;
+        case 7:
+                if (messageId == 0x1B)
+                        whichQ = 0;
+                else if (messageId == 0x1C && tp->num_tx_rings > 1)
+                        whichQ = 1;
+                break;
+        }
+
+        if (whichQ != 0xffffffff) {
+                *qnum = whichQ;
+                rc = true;
+        }
+
+        return rc;
+}
+
+static bool
+rtl8126_vec_2_rx_q_num(
+        struct rtl8126_private *tp,
+        u32 messageId,
+        u32 *qnum
+)
+{
+        u32 whichQ = 0xffffffff;
+        bool rc = false;
+
+        switch (tp->HwSuppIsrVer) {
+        case 2:
+        case 3:
+        case 4:
+        case 5:
+        case 6:
+        case 7:
+                if (messageId < tp->HwSuppNumRxQueues)
+                        whichQ = messageId;
+                break;
+        }
+
+        if (whichQ != 0xffffffff) {
+                *qnum = whichQ;
+                rc = true;
+        }
+
+        return rc;
+}
+
+void
+rtl8126_hw_set_timer_int(struct rtl8126_private *tp,
+                         u32 message_id,
+                         u8 timer_intmiti_val)
+{
+        u32 qnum;
+
+        switch (tp->HwSuppIntMitiVer) {
+        case 4:
+        case 5:
+        case 6:
+                //ROK
+                if (rtl8126_vec_2_rx_q_num(tp, message_id, &qnum))
+                        RTL_W8(tp,INT_MITI_V2_0_RX + 8 * qnum, timer_intmiti_val);
+                //TOK
+                if (rtl8126_vec_2_tx_q_num(tp, message_id, &qnum))
+                        RTL_W8(tp,INT_MITI_V2_0_TX + 8 * qnum, timer_intmiti_val);
                 break;
         }
 }
@@ -4423,10 +4188,10 @@ rtl8126_xmii_reset_pending(struct net_device *dev)
         unsigned int retval;
         unsigned long flags;
 
-        spin_lock_irqsave(&tp->phy_lock, flags);
+        r8126_spin_lock(&tp->phy_lock, flags);
         rtl8126_mdio_write(tp, 0x1f, 0x0000);
         retval = rtl8126_mdio_read(tp, MII_BMCR) & BMCR_RESET;
-        spin_unlock_irqrestore(&tp->phy_lock, flags);
+        r8126_spin_unlock(&tp->phy_lock, flags);
 
         return retval;
 }
@@ -4435,10 +4200,10 @@ static unsigned int
 _rtl8126_xmii_link_ok(struct net_device *dev)
 {
         struct rtl8126_private *tp = netdev_priv(dev);
-        u16 status;
+        u32 status;
 
-        status = RTL_R16(tp, PHYstatus);
-        if (status == 0xffff)
+        status = rtl8126_get_phy_status(tp);
+        if (status == UINT_MAX)
                 return 0;
 
         return (status & LinkStatus) ? 1 : 0;
@@ -4488,7 +4253,7 @@ rtl8126_xmii_reset_enable(struct net_device *dev)
         if (rtl8126_is_in_phy_disable_mode(dev))
                 return;
 
-        spin_lock_irqsave(&tp->phy_lock, flags);
+        r8126_spin_lock(&tp->phy_lock, flags);
 
         rtl8126_mdio_write(tp, 0x1f, 0x0000);
         rtl8126_mdio_write(tp, MII_ADVERTISE, rtl8126_mdio_read(tp, MII_ADVERTISE) &
@@ -4502,7 +4267,7 @@ rtl8126_xmii_reset_enable(struct net_device *dev)
 
         ret = rtl8126_wait_phy_reset_complete(tp);
 
-        spin_unlock_irqrestore(&tp->phy_lock, flags);
+        r8126_spin_unlock(&tp->phy_lock, flags);
 
         if (ret != 0 && netif_msg_link(tp))
                 printk(KERN_ERR "%s: PHY reset failed.\n", dev->name);
@@ -4557,22 +4322,6 @@ rtl8126_issue_offset_99_event(struct rtl8126_private *tp)
         rtl8126_mac_ocp_write(tp, 0xE09A,  rtl8126_mac_ocp_read(tp, 0xE09A) | BIT_0);
 }
 
-#ifdef ENABLE_DASH_SUPPORT
-static void
-NICChkTypeEnableDashInterrupt(struct rtl8126_private *tp)
-{
-        if (tp->DASH) {
-                //
-                // even disconnected, enable 3 dash interrupt mask bits for in-band/out-band communication
-                //
-                if (HW_DASH_SUPPORT_TYPE_2(tp) || HW_DASH_SUPPORT_TYPE_3(tp)) {
-                        rtl8126_enable_dash2_interrupt(tp);
-                        RTL_W16(tp, IntrMask, (ISRIMR_DASH_INTR_EN | ISRIMR_DASH_INTR_CMAC_RESET));
-                }
-        }
-}
-#endif
-
 static int rtl8126_enable_eee_plus(struct rtl8126_private *tp)
 {
         rtl8126_mac_ocp_write(tp, 0xE080, rtl8126_mac_ocp_read(tp, 0xE080)|BIT_1);
@@ -4602,10 +4351,12 @@ rtl8126_link_on_patch(struct net_device *dev)
 {
         struct rtl8126_private *tp = netdev_priv(dev);
         unsigned long flags;
+        u32 status;
 
         rtl8126_hw_config(dev);
 
-        if (RTL_R8(tp, PHYstatus) & _10bps)
+        status = rtl8126_get_phy_status(tp);
+        if (status & _10bps)
                 rtl8126_enable_eee_plus(tp);
 
         rtl8126_hw_start(dev);
@@ -4614,12 +4365,12 @@ rtl8126_link_on_patch(struct net_device *dev)
 
         netif_tx_wake_all_queues(dev);
 
-        spin_lock_irqsave(&tp->phy_lock, flags);
+        r8126_spin_lock(&tp->phy_lock, flags);
         tp->phy_reg_aner = rtl8126_mdio_read(tp, MII_EXPANSION);
         tp->phy_reg_anlpar = rtl8126_mdio_read(tp, MII_LPA);
         tp->phy_reg_gbsr = rtl8126_mdio_read(tp, MII_STAT1000);
         tp->phy_reg_status_2500 = rtl8126_mdio_direct_read_phy_ocp(tp, 0xA5D6);
-        spin_unlock_irqrestore(&tp->phy_lock, flags);
+        r8126_spin_unlock(&tp->phy_lock, flags);
 
 #ifdef ENABLE_PTP_SUPPORT
         if (tp->EnablePtp)
@@ -4631,11 +4382,14 @@ static void
 rtl8126_link_down_patch(struct net_device *dev)
 {
         struct rtl8126_private *tp = netdev_priv(dev);
+        unsigned long flags;
 
+        r8126_spin_lock(&tp->phy_lock, flags);
         tp->phy_reg_aner = 0;
         tp->phy_reg_anlpar = 0;
         tp->phy_reg_gbsr = 0;
         tp->phy_reg_status_2500 = 0;
+        r8126_spin_unlock(&tp->phy_lock, flags);
 
         rtl8126_disable_eee_plus(tp);
 
@@ -4654,11 +4408,6 @@ rtl8126_link_down_patch(struct net_device *dev)
         rtl8126_enable_hw_linkchg_interrupt(tp);
 
         //rtl8126_set_speed(dev, tp->autoneg, tp->speed, tp->duplex, tp->advertising);
-
-#ifdef ENABLE_DASH_SUPPORT
-        if (tp->DASH)
-                NICChkTypeEnableDashInterrupt(tp);
-#endif
 }
 
 static void
@@ -4786,7 +4535,7 @@ rtl8126_wait_ll_share_fifo_ready(struct net_device *dev)
         int i;
 
         for (i = 0; i < 10; i++) {
-                fsleep(100);
+                udelay(100);
                 if (RTL_R16(tp, 0xD2) & BIT_9)
                         break;
         }
@@ -4867,7 +4616,7 @@ rtl8126_init_pci_offset_99(struct rtl8126_private *tp)
 static void
 rtl8126_disable_pci_offset_180(struct rtl8126_private *tp)
 {
-        rtl8126_clear_set_mac_ocp_bit(tp, 0xE092, 0x00FF, BIT_3);
+        rtl8126_clear_mac_ocp_bit(tp, 0xE092, 0x00FF);
 }
 
 static void
@@ -5054,7 +4803,8 @@ rtl8126_disable_linkchg_wakeup(struct net_device *dev)
         switch (tp->HwSuppLinkChgWakeUpVer) {
         case 3:
                 RTL_W8(tp, Config3, RTL_R8(tp, Config3) & ~LinkUp);
-                rtl8126_clear_mac_ocp_bit(tp, 0xE0C6,  (BIT_5 | BIT_4 | BIT_3 | BIT_2 | BIT_1 | BIT_0));
+                if (!(rtl8126_mac_ocp_read(tp, 0xE0C6) & BIT_0))
+                        rtl8126_clear_set_mac_ocp_bit(tp, 0xE0C6, (BIT_5 | BIT_3 | BIT_2 | BIT_1), BIT_4);
                 break;
         }
 }
@@ -5152,7 +4902,7 @@ static void
 rtl8126_set_hw_wol(struct net_device *dev, u32 wolopts)
 {
         struct rtl8126_private *tp = netdev_priv(dev);
-        int i,tmp;
+        int i,tmp = 0;
         static struct {
                 u32 opt;
                 u16 reg;
@@ -5296,7 +5046,7 @@ rtl8126_set_wol_link_speed(struct net_device *dev)
         u16 status_2500;
         u16 aner;
 
-        spin_lock_irqsave(&tp->phy_lock, flags);
+        r8126_spin_lock(&tp->phy_lock, flags);
 
         if (tp->autoneg != AUTONEG_ENABLE)
                 goto exit;
@@ -5365,8 +5115,6 @@ rtl8126_set_wol_link_speed(struct net_device *dev)
                 goto exit;
 
 skip_check_lpa:
-        if (tp->DASH)
-                auto_nego |= (ADVERTISE_100FULL | ADVERTISE_100HALF | ADVERTISE_10HALF | ADVERTISE_10FULL);
 
 #ifdef CONFIG_DOWN_SPEED_100
         auto_nego |= (ADVERTISE_100FULL | ADVERTISE_100HALF | ADVERTISE_10HALF | ADVERTISE_10FULL);
@@ -5381,7 +5129,7 @@ skip_check_lpa:
         rtl8126_phy_restart_nway(dev);
 
 exit:
-        spin_unlock_irqrestore(&tp->phy_lock, flags);
+        r8126_spin_unlock(&tp->phy_lock, flags);
 
         return;
 }
@@ -5409,7 +5157,7 @@ rtl8126_powerdown_pll(struct net_device *dev, u8 from_suspend)
                 return;
 
         tp->check_keep_link_speed = 0;
-        if (tp->wol_enabled == WOL_ENABLED || tp->DASH || tp->EnableKCPOffload) {
+        if (tp->wol_enabled == WOL_ENABLED || tp->EnableKCPOffload) {
                 rtl8126_set_hw_wol(dev, tp->wol_opts);
 
                 rtl8126_enable_cfg9346_write(tp);
@@ -5444,9 +5192,6 @@ rtl8126_powerdown_pll(struct net_device *dev, u8 from_suspend)
         if (HW_FIBER_MODE_ENABLED(tp))
                 return;
 #endif /* ENABLE_FIBER_SUPPORT */
-
-        if (tp->DASH)
-                return;
 
         rtl8126_phy_power_down(dev);
 
@@ -5566,7 +5311,7 @@ rtl8126_set_speed_xmii(struct net_device *dev,
         int ctrl_2500 = 0;
         int rc = -EINVAL;
 
-        spin_lock_irqsave(&tp->phy_lock, flags);
+        r8126_spin_lock(&tp->phy_lock, flags);
 
         if (!rtl8126_is_speed_mode_valid(speed)) {
                 speed = SPEED_5000;
@@ -5641,7 +5386,7 @@ rtl8126_set_speed_xmii(struct net_device *dev,
 
         rc = 0;
 out:
-        spin_unlock_irqrestore(&tp->phy_lock, flags);
+        r8126_spin_unlock(&tp->phy_lock, flags);
 
         return rc;
 }
@@ -5943,12 +5688,8 @@ rtl8126_rx_vlan_skb(struct rtl8126_private *tp,
 static netdev_features_t rtl8126_fix_features(struct net_device *dev,
                 netdev_features_t features)
 {
-        if (dev->mtu > MSS_MAX)
+        if (dev->mtu > MSS_MAX || dev->mtu > ETH_DATA_LEN)
                 features &= ~NETIF_F_ALL_TSO;
-        if (dev->mtu > ETH_DATA_LEN) {
-                features &= ~NETIF_F_ALL_TSO;
-                features &= ~NETIF_F_ALL_CSUM;
-        }
 #ifndef CONFIG_R8126_VLAN
         features &= ~NETIF_F_ALL_CSUM;
 #endif
@@ -6075,10 +5816,10 @@ static void rtl8126_gset_xmii(struct net_device *dev,
                         advertising |= RTK_ADVERTISED_5000baseX_Full;
         }
 
-        spin_lock_irqsave(&tp->phy_lock, flags);
+        r8126_spin_lock(&tp->phy_lock, flags);
+
         rtl8126_mdio_write(tp, 0x1F, 0x0000);
         bmcr = rtl8126_mdio_read(tp, MII_BMCR);
-        spin_unlock_irqrestore(&tp->phy_lock, flags);
         if (bmcr & BMCR_ANENABLE) {
                 autoneg = AUTONEG_ENABLE;
                 advertising |= ADVERTISED_Autoneg;
@@ -6088,7 +5829,7 @@ static void rtl8126_gset_xmii(struct net_device *dev,
 
         advertising |= ADVERTISED_TP;
 
-        status = RTL_R32(tp, PHYstatus);
+        status = rtl8126_get_phy_status(tp);
         if (netif_running(dev) && (status & LinkStatus))
                 report_lpa = 1;
 #ifdef ENABLE_FIBER_SUPPORT
@@ -6203,6 +5944,7 @@ static void rtl8126_gset_xmii(struct net_device *dev,
         cmd->base.port = PORT_TP;
         cmd->base.eth_tp_mdix = rtl8126_get_mdi_status(tp);
 #endif
+        r8126_spin_unlock(&tp->phy_lock, flags);
 }
 
 #if LINUX_VERSION_CODE > KERNEL_VERSION(2,4,22)
@@ -6565,7 +6307,7 @@ static int rtl_get_eeprom(struct net_device *dev, struct ethtool_eeprom *eeprom,
                 pci_write_config_word(tp->pci_dev, VPD_addr, (u16)i*4);
                 ret = -EFAULT;
                 for (j = 0; j < 10; j++) {
-                        fsleep(400);
+                        udelay(400);
                         pci_read_config_word(tp->pci_dev, VPD_addr, &tmp);
                         if (tmp&0x8000) {
                                 ret = 0;
@@ -6736,10 +6478,10 @@ static u32
 rtl8126_device_lpi_t_to_ethtool_lpi_t(struct rtl8126_private *tp , u32 lpi_timer)
 {
         u32 to_us;
-        u16 status;
+        u32 status;
 
         to_us = lpi_timer * 80;
-        status = RTL_R16(tp, PHYstatus);
+        status = rtl8126_get_phy_status(tp);
         if (status & LinkStatus) {
                 /*link on*/
                 if (HW_SUPP_PHY_LINK_SPEED_5000M(tp)) {
@@ -6800,17 +6542,22 @@ rtl_ethtool_get_eee(struct net_device *net, struct ethtool_keee *edata)
         __ETHTOOL_DECLARE_LINK_MODE_MASK(common);
         struct rtl8126_private *tp = netdev_priv(net);
         struct ethtool_keee *eee = &tp->eee;
+        unsigned long flags;
         u32 tx_lpi_timer;
         u16 val;
 
         if (unlikely(tp->rtk_enable_diag))
                 return -EBUSY;
 
+        r8126_spin_lock(&tp->phy_lock, flags);
+
         /* Get LP advertisement EEE */
         val = rtl8126_mdio_direct_read_phy_ocp(tp, 0xA5D2);
         mii_eee_cap1_mod_linkmode_t(edata->lp_advertised, val);
         val = rtl8126_mdio_direct_read_phy_ocp(tp, 0xA6D0);
         mii_eee_cap2_mod_linkmode_sup_t(edata->lp_advertised, val);
+
+        r8126_spin_unlock(&tp->phy_lock, flags);
 
         /* Get EEE Tx LPI timer*/
         tx_lpi_timer = rtl8126_device_lpi_t_to_ethtool_lpi_t(tp, eee->tx_lpi_timer);
@@ -6836,11 +6583,15 @@ rtl_ethtool_set_eee(struct net_device *net, struct ethtool_keee *edata)
         __ETHTOOL_DECLARE_LINK_MODE_MASK(tmp);
         struct rtl8126_private *tp = netdev_priv(net);
         struct ethtool_keee *eee = &tp->eee;
+        unsigned long flags;
         int rc = 0;
 
-        if (!HW_HAS_WRITE_PHY_MCU_RAM_CODE(tp) ||
-            tp->DASH)
-                return -EOPNOTSUPP;
+        r8126_spin_lock(&tp->phy_lock, flags);
+
+        if (!HW_HAS_WRITE_PHY_MCU_RAM_CODE(tp)) {
+                rc = -EOPNOTSUPP;
+                goto out;
+        }
 
         if (unlikely(tp->rtk_enable_diag)) {
                 dev_printk(KERN_WARNING, tp_to_dev(tp), "Diag Enabled\n");
@@ -6897,6 +6648,8 @@ rtl_ethtool_set_eee(struct net_device *net, struct ethtool_keee *edata)
         rtl_nway_reset(net);
 
 out:
+        r8126_spin_unlock(&tp->phy_lock, flags);
+
         return rc;
 }
 #else
@@ -6906,10 +6659,13 @@ rtl_ethtool_get_eee(struct net_device *net, struct ethtool_eee *edata)
         struct rtl8126_private *tp = netdev_priv(net);
         struct ethtool_eee *eee = &tp->eee;
         u32 lp, adv, tx_lpi_timer, supported = 0;
+        unsigned long flags;
         u16 val;
 
         if (unlikely(tp->rtk_enable_diag))
                 return -EBUSY;
+
+        r8126_spin_lock(&tp->phy_lock, flags);
 
         /* Get Supported EEE */
         //val = rtl8126_mdio_direct_read_phy_ocp(tp, 0xA5C4);
@@ -6925,6 +6681,8 @@ rtl_ethtool_get_eee(struct net_device *net, struct ethtool_eee *edata)
         val = rtl8126_mdio_direct_read_phy_ocp(tp, 0xA6D0);
         if (val & RTK_LPA_EEE_ADVERTISE_2500FULL)
                 lp |= ADVERTISED_2500baseX_Full;
+
+        r8126_spin_unlock(&tp->phy_lock, flags);
 
         /* Get EEE Tx LPI timer*/
         tx_lpi_timer = rtl8126_device_lpi_t_to_ethtool_lpi_t(tp, eee->tx_lpi_timer);
@@ -6948,12 +6706,16 @@ rtl_ethtool_set_eee(struct net_device *net, struct ethtool_eee *edata)
 {
         struct rtl8126_private *tp = netdev_priv(net);
         struct ethtool_eee *eee = &tp->eee;
+        unsigned long flags;
         u32 advertising;
         int rc = 0;
 
-        if (!HW_HAS_WRITE_PHY_MCU_RAM_CODE(tp) ||
-            tp->DASH)
-                return -EOPNOTSUPP;
+        r8126_spin_lock(&tp->phy_lock, flags);
+
+        if (!HW_HAS_WRITE_PHY_MCU_RAM_CODE(tp)) {
+                rc = -EOPNOTSUPP;
+                goto out;
+        }
 
         if (unlikely(tp->rtk_enable_diag)) {
                 dev_printk(KERN_WARNING, tp_to_dev(tp), "Diag Enabled\n");
@@ -7012,6 +6774,8 @@ rtl_ethtool_set_eee(struct net_device *net, struct ethtool_eee *edata)
         rtl_nway_reset(net);
 
 out:
+        r8126_spin_unlock(&tp->phy_lock, flags);
+
         return rc;
 }
 #endif /* LINUX_VERSION_CODE >= KERNEL_VERSION(6,9,0) */
@@ -7225,11 +6989,35 @@ rtl8126_wait_phy_ups_resume(struct net_device *dev, u16 PhyState)
 #endif
 }
 
-void
-rtl8126_enable_now_is_oob(struct rtl8126_private *tp)
+static void
+rtl8126_set_mcu_d3_stack(struct rtl8126_private *tp)
+{
+        switch (tp->mcfg) {
+        case CFG_METHOD_2:
+                rtl8126_mac_ocp_write(tp, 0xD018, 0xD116);
+                rtl8126_mac_ocp_write(tp, 0xD116, 0x4E22);
+                break;
+        case CFG_METHOD_3:
+                rtl8126_mac_ocp_write(tp, 0xD018, 0xD116);
+                rtl8126_mac_ocp_write(tp, 0xD116, 0x59EC);
+                break;
+        default:
+                return;
+        }
+}
+
+static void
+_rtl8126_enable_now_is_oob(struct rtl8126_private *tp)
 {
         if (tp->HwSuppNowIsOobVer == 1)
                 RTL_W8(tp, MCUCmd_reg, RTL_R8(tp, MCUCmd_reg) | Now_is_oob);
+}
+
+void
+rtl8126_enable_now_is_oob(struct rtl8126_private *tp)
+{
+        rtl8126_set_mcu_d3_stack(tp);
+        _rtl8126_enable_now_is_oob(tp);
 }
 
 void
@@ -7246,14 +7034,6 @@ rtl8126_exit_oob(struct net_device *dev)
         u16 data16;
 
         rtl8126_disable_rx_packet_filter(tp);
-
-        if (HW_DASH_SUPPORT_DASH(tp)) {
-                rtl8126_driver_start(tp);
-                rtl8126_dash2_disable_txrx(dev);
-#ifdef ENABLE_DASH_SUPPORT
-                DashHwInit(dev);
-#endif
-        }
 
 #ifdef ENABLE_REALWOW_SUPPORT
         rtl8126_realwow_hw_init(dev);
@@ -7336,8 +7116,6 @@ _rtl8126_set_hw_mcu_patch_code_ver(struct rtl8126_private *tp, u64 ver)
 
         /* Switch back to page 0 */
         rtl8126_switch_mac_mcu_ram_code_page(tp, 0);
-
-        tp->hw_mcu_patch_code_ver = tp->bin_mcu_patch_code_ver;
 }
 
 static void
@@ -7462,8 +7240,8 @@ rtl8126_set_mac_mcu_8126a_2(struct net_device *dev)
 {
         struct rtl8126_private *tp = netdev_priv(dev);
         static const u16 mcu_patch_code[] =  {
-                0xE010, 0xE02C, 0xE04E, 0xE0A4, 0xE0A8, 0xE0AB, 0xE0AE, 0xE0B1, 0xE0B3,
-                0xE0B5, 0xE0B7, 0xE0B9, 0xE0BB, 0xE0BD, 0xE0BF, 0xE0C1, 0xC716, 0xC616,
+                0xE010, 0xE02C, 0xE04E, 0xE0A4, 0xE0A8, 0xE0AB, 0xE0AE, 0xE0B1, 0xE0B5,
+                0xE0B7, 0xE0B9, 0xE0BB, 0xE0BD, 0xE0BF, 0xE0C1, 0xE0C3, 0xC716, 0xC616,
                 0x9EE0, 0xC616, 0x65C0, 0x1500, 0xF009, 0xC714, 0x66E0, 0x41B5, 0x8EE0,
                 0xC611, 0x75C0, 0x4858, 0x9DC0, 0xC707, 0xC608, 0x9EE0, 0xC608, 0xC502,
                 0xBD00, 0x0100, 0xE86C, 0xE000, 0xA000, 0xB404, 0xB430, 0xC070, 0xE926,
@@ -7482,10 +7260,11 @@ rtl8126_set_mac_mcu_8126a_2(struct net_device *dev)
                 0x4898, 0x9902, 0xE7C0, 0xC00A, 0xC606, 0xBE00, 0x0C01, 0x1400, 0xF1FE,
                 0xFF80, 0x2362, 0xD456, 0xD404, 0xE400, 0x4166, 0x9CF6, 0xC002, 0xB800,
                 0x14A6, 0x49D1, 0xC602, 0xBE00, 0x4160, 0x49D1, 0xC602, 0xBE00, 0x41E6,
-                0x49D1, 0xC602, 0xBE00, 0x4282, 0xC602, 0xBE00, 0x0000, 0xC602, 0xBE00,
-                0x0000, 0xC602, 0xBE00, 0x0000, 0xC602, 0xBE00, 0x0000, 0xC602, 0xBE00,
-                0x0000, 0xC602, 0xBE00, 0x0000, 0xC602, 0xBE00, 0x0000, 0xC602, 0xBE00,
-                0x0000, 0xC602, 0xBE00, 0x0000, 0x6847, 0x0A18, 0x0C02, 0x0B30
+                0x49D1, 0xC602, 0xBE00, 0x4282, 0xC104, 0xC202, 0xBA00, 0x234C, 0xD116,
+                0xC602, 0xBE00, 0x0000, 0xC602, 0xBE00, 0x0000, 0xC602, 0xBE00, 0x0000,
+                0xC602, 0xBE00, 0x0000, 0xC602, 0xBE00, 0x0000, 0xC602, 0xBE00, 0x0000,
+                0xC602, 0xBE00, 0x0000, 0xC602, 0xBE00, 0x0000, 0x6847, 0x0019, 0x041C,
+                0x1322
         };
 
         /* Get BIN mac mcu patch code version */
@@ -7503,8 +7282,9 @@ rtl8126_set_mac_mcu_8126a_2(struct net_device *dev)
         rtl8126_mac_ocp_write(tp, 0xFC30, 0x415E);
         rtl8126_mac_ocp_write(tp, 0xFC32, 0x41E4);
         rtl8126_mac_ocp_write(tp, 0xFC34, 0x4280);
+        rtl8126_mac_ocp_write(tp, 0xFC36, 0x234A);
 
-        rtl8126_mac_ocp_write(tp, 0xFC48, 0x007C);
+        rtl8126_mac_ocp_write(tp, 0xFC48, 0x00FC);
 }
 
 static void
@@ -7512,21 +7292,44 @@ rtl8126_set_mac_mcu_8126a_3(struct net_device *dev)
 {
         struct rtl8126_private *tp = netdev_priv(dev);
         static const u16 mcu_patch_code[] =  {
-                0xE010, 0xE02C, 0xE04E, 0xE052, 0xE055, 0xE058, 0xE05B, 0xE05D, 0xE05F,
-                0xE061, 0xE063, 0xE065, 0xE067, 0xE069, 0xE06B, 0xE06D, 0xC716, 0xC616,
-                0x9EE0, 0xC616, 0x65C0, 0x1500, 0xF009, 0xC714, 0x66E0, 0x41B5, 0x8EE0,
-                0xC611, 0x75C0, 0x4858, 0x9DC0, 0xC707, 0xC608, 0x9EE0, 0xC608, 0xC502,
-                0xBD00, 0x0100, 0xE86C, 0xE000, 0xA000, 0xB404, 0xB430, 0xC070, 0xE926,
-                0xC2FE, 0x400A, 0xF11A, 0x63A4, 0x1A00, 0x49B0, 0xF002, 0x4820, 0x49B1,
-                0xF002, 0x4821, 0x49B2, 0xF002, 0x4822, 0x49B3, 0xF002, 0x4823, 0xC411,
-                0x6380, 0x48B0, 0x8B80, 0x6320, 0x41DA, 0x8B20, 0x6380, 0x4830, 0x8B80,
-                0xE003, 0x73A4, 0x9B20, 0xC302, 0xBB00, 0x55E2, 0xC070, 0xE022, 0x4166,
-                0x9CF6, 0xC602, 0xBE00, 0x14A6, 0x49D1, 0xC602, 0xBE00, 0x4178, 0x49D1,
-                0xC602, 0xBE00, 0x41FE, 0x49D1, 0xC602, 0xBE00, 0x429A, 0xC602, 0xBE00,
-                0x0000, 0xC602, 0xBE00, 0x0000, 0xC602, 0xBE00, 0x0000, 0xC602, 0xBE00,
-                0x0000, 0xC602, 0xBE00, 0x0000, 0xC602, 0xBE00, 0x0000, 0xC602, 0xBE00,
-                0x0000, 0xC602, 0xBE00, 0x0000, 0xC602, 0xBE00, 0x0000, 0xC602, 0xBE00,
-                0x0000, 0x6847, 0x0B18, 0x0C02, 0x0D10
+                0xE00A, 0xE026, 0xE048, 0xE04C, 0xE04F, 0xE052, 0xE055, 0xE0AB, 0xE0F8,
+                0xE141, 0xC716, 0xC616, 0x9EE0, 0xC616, 0x65C0, 0x1500, 0xF009, 0xC714,
+                0x66E0, 0x41B5, 0x8EE0, 0xC611, 0x75C0, 0x4858, 0x9DC0, 0xC707, 0xC608,
+                0x9EE0, 0xC608, 0xC502, 0xBD00, 0x0100, 0xE86C, 0xE000, 0xA000, 0xB404,
+                0xB430, 0xC070, 0xE926, 0xC2FE, 0x400A, 0xF11A, 0x63A4, 0x1A00, 0x49B0,
+                0xF002, 0x4820, 0x49B1, 0xF002, 0x4821, 0x49B2, 0xF002, 0x4822, 0x49B3,
+                0xF002, 0x4823, 0xC411, 0x6380, 0x48B0, 0x8B80, 0x6320, 0x41DA, 0x8B20,
+                0x6380, 0x4830, 0x8B80, 0xE003, 0x73A4, 0x9B20, 0xC302, 0xBB00, 0x55E2,
+                0xC070, 0xE022, 0x4166, 0x9CF6, 0xC602, 0xBE00, 0x14A6, 0x49D1, 0xC602,
+                0xBE00, 0x4178, 0x49D1, 0xC602, 0xBE00, 0x41FE, 0x49D1, 0xC602, 0xBE00,
+                0x429A, 0xC74B, 0x76E2, 0xC54A, 0x402E, 0xF034, 0x76E0, 0x402E, 0xF006,
+                0xC503, 0xC403, 0xBC00, 0xC0BC, 0x0AAE, 0x76F0, 0x1601, 0xF023, 0xC741,
+                0x1E04, 0x9EE0, 0x1E40, 0x9EE4, 0xC63D, 0x9EE8, 0xC73D, 0x76E0, 0x4863,
+                0x9EE0, 0xC73A, 0x76E0, 0x48EA, 0x48EB, 0x9EE0, 0xC736, 0x1E01, 0x9EE2,
+                0xC72D, 0x76E0, 0x486F, 0x9EE0, 0xC72D, 0x76E0, 0x48E3, 0x9EE0, 0xC728,
+                0x1E0E, 0x9EE0, 0xC71D, 0x1E01, 0x9EE4, 0xE00D, 0x1E00, 0x9EF0, 0x1E05,
+                0xC715, 0x9EE0, 0xE00A, 0x1E00, 0x9EE2, 0xC614, 0x75CC, 0x48D2, 0x9DCC,
+                0x1E04, 0xC70B, 0x9EE0, 0xB000, 0xB001, 0xB002, 0xB003, 0xB004, 0xB005,
+                0xB006, 0xB007, 0xFFC0, 0xE428, 0xD3C0, 0xBEEF, 0x5B4A, 0xDC46, 0xE0CC,
+                0xE84E, 0xC0A2, 0x0100, 0xC010, 0xE85A, 0xE812, 0xC0B4, 0xC5F4, 0x74A0,
+                0xC6F3, 0x4026, 0xF107, 0x74A2, 0xC6EF, 0x4026, 0xF107, 0xC6ED, 0xBE00,
+                0x753A, 0xC602, 0xBE00, 0x5A3A, 0x7520, 0x49DE, 0xF102, 0xE7F9, 0xC6A1,
+                0x67C6, 0x7520, 0x22D2, 0x26DD, 0x1500, 0xF002, 0xE7F1, 0x7532, 0x26D5,
+                0x0530, 0x0D6C, 0xC42D, 0x308D, 0x7540, 0x4025, 0xF11E, 0x7542, 0x4025,
+                0xF11B, 0x7544, 0x4025, 0xF118, 0xC423, 0x7546, 0x4025, 0xF114, 0x7548,
+                0x4025, 0xF111, 0x754A, 0x4025, 0xF10E, 0xC5C0, 0xC4C0, 0x9CA2, 0xC6C0,
+                0x75CC, 0x4852, 0x9DCC, 0xC6B8, 0x1D7D, 0x9DC2, 0x1D01, 0x9DC0, 0xE7C9,
+                0xC40B, 0x7546, 0x4025, 0xF1FC, 0x7548, 0x4025, 0xF1F9, 0x754A, 0x4025,
+                0xF1F6, 0xE7C0, 0xFFFF, 0xEEEE, 0xC2A6, 0x7340, 0xC2A5, 0x4013, 0xF013,
+                0xC2AC, 0x7340, 0x4835, 0x9B40, 0xC240, 0x7358, 0x48B7, 0x48B2, 0x9B58,
+                0x7346, 0x48B7, 0x48B2, 0x9B46, 0x7340, 0x48B7, 0x48B2, 0x9B40, 0xE012,
+                0xC29A, 0x7340, 0x48B5, 0x9B40, 0xC22E, 0x7358, 0x4837, 0x4832, 0x9B58,
+                0x7346, 0x4837, 0x4832, 0x9B46, 0x7340, 0x4837, 0x4832, 0x9B40, 0xC283,
+                0x7340, 0x49BF, 0xF010, 0xC21B, 0x7344, 0x1300, 0xF104, 0x1B00, 0xC217,
+                0x9B40, 0x1B01, 0xC213, 0x9B44, 0xC213, 0x734C, 0x48B7, 0x9B4C, 0xE008,
+                0xC20C, 0x1B00, 0x9B44, 0xC20B, 0x734C, 0x4837, 0x9B4C, 0xC204, 0xC302,
+                0xBB00, 0x2384, 0xE092, 0xD3C0, 0xE428, 0xDC46, 0xC104, 0xC202, 0xBA00,
+                0x234C, 0xD116, 0x6847, 0x0119, 0x041C, 0x1134
         };
 
         /* Get BIN mac mcu patch code version */
@@ -7543,8 +7346,12 @@ rtl8126_set_mac_mcu_8126a_3(struct net_device *dev)
         rtl8126_mac_ocp_write(tp, 0xFC2E, 0x4176);
         rtl8126_mac_ocp_write(tp, 0xFC30, 0x41FC);
         rtl8126_mac_ocp_write(tp, 0xFC32, 0x4298);
+        //rtl8126_mac_ocp_write(tp, 0xFC34, 0x0AAC);
+        //rtl8126_mac_ocp_write(tp, 0xFC36, 0x5A38);
+        //rtl8126_mac_ocp_write(tp, 0xFC38, 0x2382);
+        rtl8126_mac_ocp_write(tp, 0xFC3A, 0x234A);
 
-        rtl8126_mac_ocp_write(tp, 0xFC48, 0x003C);
+        rtl8126_mac_ocp_write(tp, 0xFC48, 0x023C);
 }
 
 static void
@@ -7586,8 +7393,12 @@ static void rtl8126_release_firmware(struct rtl8126_private *tp)
 
 static void rtl8126_apply_firmware(struct rtl8126_private *tp)
 {
+        unsigned long flags;
+
         /* TODO: release firmware if rtl_fw_write_firmware signals failure. */
         if (tp->rtl_fw) {
+                r8126_spin_lock(&tp->phy_lock, flags);
+
                 rtl8126_fw_write_firmware(tp, tp->rtl_fw);
                 /* At least one firmware doesn't reset tp->ocp_base. */
                 tp->ocp_base = OCP_STD_PHY_BASE;
@@ -7601,6 +7412,8 @@ static void rtl8126_apply_firmware(struct rtl8126_private *tp)
                 tp->hw_ram_code_ver = rtl8126_get_hw_phy_mcu_code_ver(tp);
                 tp->sw_ram_code_ver = tp->hw_ram_code_ver;
                 tp->HwHasWrRamCodeToMicroP = TRUE;
+
+                r8126_spin_unlock(&tp->phy_lock, flags);
         }
 }
 #endif
@@ -7637,10 +7450,7 @@ rtl8126_hw_init(struct net_device *dev)
                 rtl8126_enable_magic_packet(dev);
 
 #ifdef ENABLE_USE_FIRMWARE_FILE
-        if (tp->rtl_fw &&
-            !tp->resume_not_chg_speed &&
-            !(HW_DASH_SUPPORT_TYPE_3(tp) &&
-              tp->HwPkgDet == 0x06))
+        if (tp->rtl_fw && !tp->resume_not_chg_speed)
                 rtl8126_apply_firmware(tp);
 #endif
 }
@@ -11655,10 +11465,7 @@ rtl8126_hw_phy_config(struct net_device *dev)
 
         tp->phy_reset_enable(dev);
 
-        if (HW_DASH_SUPPORT_TYPE_3(tp) && tp->HwPkgDet == 0x06)
-                return;
-
-        spin_lock_irqsave(&tp->phy_lock, flags);
+        r8126_spin_lock(&tp->phy_lock, flags);
 
 #ifndef ENABLE_USE_FIRMWARE_FILE
         if (!tp->rtl_fw)
@@ -11694,7 +11501,7 @@ rtl8126_hw_phy_config(struct net_device *dev)
                         rtl8126_disable_eee(tp);
         }
 
-        spin_unlock_irqrestore(&tp->phy_lock, flags);
+        r8126_spin_unlock(&tp->phy_lock, flags);
 }
 
 static void
@@ -11806,15 +11613,6 @@ rtl8126_setup_interrupt_mask(struct rtl8126_private *tp)
         } else {
                 tp->intr_mask = LinkChg | RxDescUnavail | TxOK | RxOK | SWInt;
                 tp->timer_intr_mask = LinkChg | PCSTimeout;
-
-#ifdef ENABLE_DASH_SUPPORT
-                if (tp->DASH) {
-                        if (HW_DASH_SUPPORT_TYPE_3(tp)) {
-                                tp->timer_intr_mask |= (ISRIMR_DASH_INTR_EN | ISRIMR_DASH_INTR_CMAC_RESET);
-                                tp->intr_mask |= (ISRIMR_DASH_INTR_EN | ISRIMR_DASH_INTR_CMAC_RESET);
-                        }
-                }
-#endif
         }
 }
 
@@ -11877,16 +11675,8 @@ rtl8126_init_software_variable(struct net_device *dev)
 #ifdef ENABLE_LIB_SUPPORT
         tp->ring_lib_enabled = 1;
 #endif
-
-        tp->HwSuppDashVer = 0;
-
-        tp->AllowAccessDashOcp = rtl8126_is_allow_access_dash_ocp(tp);
-
         tp->HwPkgDet = rtl8126_mac_ocp_read(tp, 0xDC00);
         tp->HwPkgDet = (tp->HwPkgDet >> 3) & 0x07;
-
-        if (HW_DASH_SUPPORT_TYPE_3(tp) && tp->HwPkgDet == 0x06)
-                eee_enable = 0;
 
         tp->HwSuppNowIsOobVer = 1;
 
@@ -11895,46 +11685,6 @@ rtl8126_init_software_variable(struct net_device *dev)
 #ifdef ENABLE_REALWOW_SUPPORT
         rtl8126_get_realwow_hw_version(dev);
 #endif //ENABLE_REALWOW_SUPPORT
-
-        if (HW_DASH_SUPPORT_DASH(tp) && rtl8126_check_dash(tp))
-                tp->DASH = 1;
-        else
-                tp->DASH = 0;
-
-        if (tp->DASH) {
-                if (HW_DASH_SUPPORT_TYPE_3(tp)) {
-                        u64 CmacMemPhysAddress;
-                        void __iomem *cmac_ioaddr = NULL;
-
-                        //map CMAC IO space
-                        CmacMemPhysAddress = rtl8126_csi_other_fun_read(tp, 0, 0x18);
-                        if (!(CmacMemPhysAddress & BIT_0)) {
-                                if (CmacMemPhysAddress & BIT_2)
-                                        CmacMemPhysAddress |=  (u64)rtl8126_csi_other_fun_read(tp, 0, 0x1C) << 32;
-
-                                CmacMemPhysAddress &=  0xFFFFFFF0;
-                                /* ioremap MMIO region */
-                                cmac_ioaddr = ioremap(CmacMemPhysAddress, R8126_REGS_SIZE);
-                        }
-
-                        if (cmac_ioaddr == NULL) {
-#if LINUX_VERSION_CODE > KERNEL_VERSION(2,6,0)
-                                if (netif_msg_probe(tp))
-                                        dev_err(&pdev->dev, "cannot remap CMAC MMIO, aborting\n");
-#endif //LINUX_VERSION_CODE > KERNEL_VERSION(2,6,0)
-                        }
-
-                        if (cmac_ioaddr == NULL)
-                                tp->DASH = 0;
-                        else
-                                tp->mapped_cmac_ioaddr = cmac_ioaddr;
-                }
-
-                eee_enable = 0;
-        }
-
-        if (HW_DASH_SUPPORT_TYPE_3(tp))
-                tp->cmac_ioaddr = tp->mapped_cmac_ioaddr;
 
         if (aspm) {
                 tp->org_pci_offset_99 = rtl8126_csi_fun0_read_byte(tp, 0x99);
@@ -12201,16 +11951,7 @@ rtl8126_release_board(struct pci_dev *pdev,
         rtl8126_rar_set(tp, tp->org_mac_addr);
         tp->wol_enabled = WOL_DISABLED;
 
-        if (!tp->DASH)
-                rtl8126_phy_power_down(dev);
-
-#ifdef ENABLE_DASH_SUPPORT
-        if (tp->DASH)
-                FreeAllocatedDashShareMemory(dev);
-#endif
-
-        if (tp->mapped_cmac_ioaddr != NULL)
-                iounmap(tp->mapped_cmac_ioaddr);
+        rtl8126_phy_power_down(dev);
 
         iounmap(ioaddr);
         pci_release_regions(pdev);
@@ -12983,21 +12724,6 @@ static int rtl8126_siocdevprivate(struct net_device *dev, struct ifreq *ifr,
         int ret = 0;
 
         switch (cmd) {
-#ifdef ENABLE_DASH_SUPPORT
-        case SIOCDEVPRIVATE_RTLDASH:
-                if (!netif_running(dev)) {
-                        ret = -ENODEV;
-                        break;
-                }
-                if (!capable(CAP_NET_ADMIN)) {
-                        ret = -EPERM;
-                        break;
-                }
-
-                ret = rtl8126_dash_ioctl(dev, ifr);
-                break;
-#endif
-
 #ifdef ENABLE_REALWOW_SUPPORT
         case SIOCDEVPRIVATE_RTLREALWOW:
                 if (!netif_running(dev)) {
@@ -13068,21 +12794,6 @@ rtl8126_do_ioctl(struct net_device *dev,
                 break;
 #endif
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5,15,0)
-#ifdef ENABLE_DASH_SUPPORT
-        case SIOCDEVPRIVATE_RTLDASH:
-                if (!netif_running(dev)) {
-                        ret = -ENODEV;
-                        break;
-                }
-                if (!capable(CAP_NET_ADMIN)) {
-                        ret = -EPERM;
-                        break;
-                }
-
-                ret = rtl8126_dash_ioctl(dev, ifr);
-                break;
-#endif
-
 #ifdef ENABLE_REALWOW_SUPPORT
         case SIOCDEVPRIVATE_RTLREALWOW:
                 if (!netif_running(dev)) {
@@ -13126,7 +12837,7 @@ rtl8126_phy_power_up(struct net_device *dev)
         if (rtl8126_is_in_phy_disable_mode(dev))
                 return;
 
-        spin_lock_irqsave(&tp->phy_lock, flags);
+        r8126_spin_lock(&tp->phy_lock, flags);
 
         rtl8126_mdio_write(tp, 0x1F, 0x0000);
         rtl8126_mdio_write(tp, MII_BMCR, BMCR_ANENABLE);
@@ -13134,7 +12845,7 @@ rtl8126_phy_power_up(struct net_device *dev)
         //wait ups resume (phy state 3)
         rtl8126_wait_phy_ups_resume(dev, 3);
 
-        spin_unlock_irqrestore(&tp->phy_lock, flags);
+        r8126_spin_unlock(&tp->phy_lock, flags);
 }
 
 static void
@@ -13148,10 +12859,10 @@ rtl8126_phy_power_down(struct net_device *dev)
                 return;
 #endif /* ENABLE_FIBER_SUPPORT */
 
-        spin_lock_irqsave(&tp->phy_lock, flags);
+        r8126_spin_lock(&tp->phy_lock, flags);
         rtl8126_mdio_write(tp, 0x1F, 0x0000);
         rtl8126_mdio_write(tp, MII_BMCR, BMCR_ANENABLE | BMCR_PDOWN);
-        spin_unlock_irqrestore(&tp->phy_lock, flags);
+        r8126_spin_unlock(&tp->phy_lock, flags);
 }
 
 static int __devinit
@@ -13743,11 +13454,6 @@ static int rtl8126_poll(napi_ptr napi, napi_budget budget)
         RTL_NAPI_QUOTA_UPDATE(dev, work_done, budget);
 
         if (work_done < work_to_do) {
-#ifdef ENABLE_DASH_SUPPORT
-                if (tp->DASH)
-                        HandleDashInterrupt(tp->dev);
-#endif
-
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4,10,0)
                 if (RTL_NETIF_RX_COMPLETE(dev, napi, work_done) == FALSE)
                         return RTL_NAPI_RETURN_VALUE;
@@ -13786,11 +13492,6 @@ static int rtl8126_poll_msix_ring(napi_ptr napi, napi_budget budget)
         RTL_NAPI_QUOTA_UPDATE(dev, work_done, budget);
 
         if (work_done < work_to_do) {
-#ifdef ENABLE_DASH_SUPPORT
-                if (tp->DASH && message_id == 0)
-                        HandleDashInterrupt(tp->dev);
-#endif
-
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4,10,0)
                 if (RTL_NETIF_RX_COMPLETE(dev, napi, work_done) == FALSE)
                         return RTL_NAPI_RETURN_VALUE;
@@ -14123,11 +13824,6 @@ rtl8126_init_one(struct pci_dev *pdev,
 
         netdev_sw_irq_coalesce_default_on(dev);
 
-#ifdef ENABLE_DASH_SUPPORT
-        if (tp->DASH)
-                AllocateDashShareMemory(dev);
-#endif
-
 #ifdef ENABLE_LIB_SUPPORT
         BLOCKING_INIT_NOTIFIER_HEAD(&tp->lib_nh);
 #endif
@@ -14218,12 +13914,6 @@ rtl8126_remove_one(struct pci_dev *pdev)
 
         rtl8126_cancel_all_schedule_work(tp);
 
-#ifdef  CONFIG_R8126_NAPI
-        rtl8126_del_napi(tp);
-#endif
-        if (HW_DASH_SUPPORT_DASH(tp))
-                rtl8126_driver_stop(tp);
-
         rtl8126_disable_pci_offset_180(tp);
 
 #ifdef ENABLE_R8126_SYSFS
@@ -14231,6 +13921,9 @@ rtl8126_remove_one(struct pci_dev *pdev)
 #endif //ENABLE_R8126_SYSFS
 
         unregister_netdev(dev);
+#ifdef  CONFIG_R8126_NAPI
+        rtl8126_del_napi(tp);
+#endif
         rtl8126_disable_msi(pdev, tp);
 #ifdef ENABLE_R8126_PROCFS
         rtl8126_proc_remove(dev);
@@ -14276,6 +13969,12 @@ rtl8126_set_rxbufsize(struct rtl8126_private *tp,
         tp->rx_buf_page_order = rtl8126_rx_page_order(tp->rx_buf_sz, PAGE_SIZE);
         tp->rx_buf_page_size = rtl8126_rx_page_size(tp->rx_buf_page_order);
 #endif //ENABLE_PAGE_REUSE
+}
+
+static void
+rtl8126_set_rms(struct rtl8126_private *tp, u16 rms)
+{
+        RTL_W16(tp, RxMaxSize, rms | AcceppVlanPhys);
 }
 
 static void rtl8126_free_irq(struct rtl8126_private *tp)
@@ -14725,7 +14424,7 @@ rtl8126_clear_tcam_entries(struct rtl8126_private *tp)
                 return;
 
         rtl8126_set_mac_ocp_bit(tp, 0xEB54, BIT_0);
-        fsleep(1);
+        udelay(1);
         rtl8126_clear_mac_ocp_bit(tp, 0xEB54, BIT_0);
 }
 
@@ -14816,7 +14515,10 @@ rtl8126_hw_config(struct net_device *dev)
 
         mac_ocp_data = rtl8126_mac_ocp_read(tp, 0xE614);
         mac_ocp_data &= ~(BIT_10 | BIT_9 | BIT_8);
-        mac_ocp_data |= ((4 & 0x07) << 8);
+        if (tp->EnableTxNoClose)
+                mac_ocp_data |= (4 << 8);
+        else
+                mac_ocp_data |= (3 << 8);
         rtl8126_mac_ocp_write(tp, 0xE614, mac_ocp_data);
 
         rtl8126_set_tx_q_num(tp, rtl8126_tot_tx_rings(tp));
@@ -14870,10 +14572,7 @@ rtl8126_hw_config(struct net_device *dev)
         rtl8126_mac_ocp_write(tp, 0xD430, mac_ocp_data);
 
         //rtl8126_mac_ocp_write(tp, 0xE0C0, 0x4F87);
-        if (!tp->DASH)
-                RTL_W8(tp, 0xD0, RTL_R8(tp, 0xD0) | BIT_6 | BIT_7);
-        else
-                RTL_W8(tp, 0xD0, RTL_R8(tp, 0xD0) & ~(BIT_6 | BIT_7));
+        RTL_W8(tp, 0xD0, RTL_R8(tp, 0xD0) | BIT_6 | BIT_7);
 
         rtl8126_disable_eee_plus(tp);
 
@@ -14908,7 +14607,7 @@ rtl8126_hw_config(struct net_device *dev)
             (tp->features & RTL_FEATURE_MSIX)) {
                 int i;
                 for (i = 0; i < tp->irq_nvecs; i++)
-                        rtl8126_hw_set_timer_int_8125(tp, i, timer_count_v2);
+                        rtl8126_hw_set_timer_int(tp, i, timer_count_v2);
         }
 
         rtl8126_enable_exit_l1_mask(tp);
@@ -14934,7 +14633,7 @@ rtl8126_hw_config(struct net_device *dev)
 #else
         rtl8126_hw_set_features(dev, dev->features);
 #endif
-        RTL_W16(tp, RxMaxSize, tp->rms);
+        rtl8126_set_rms(tp, tp->rms);
 
         rtl8126_disable_rxdvgate(dev);
 
@@ -14964,16 +14663,11 @@ rtl8126_hw_config(struct net_device *dev)
         /* Set Rx packet filter */
         rtl8126_hw_set_rx_packet_filter(dev);
 
-#ifdef ENABLE_DASH_SUPPORT
-        if (tp->DASH && !tp->dash_printer_enabled)
-                NICChkTypeEnableDashInterrupt(tp);
-#endif
-
         rtl8126_enable_aspm_clkreq_lock(tp, aspm ? 1 : 0);
 
         rtl8126_disable_cfg9346_write(tp);
 
-        fsleep(10);
+        udelay(10);
 }
 
 void
@@ -15970,6 +15664,7 @@ u8 rtl8126_get_l4_protocol(struct sk_buff *skb)
         return ip_protocol;
 }
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3,19,0)
 static bool rtl8126_skb_pad_with_len(struct sk_buff *skb, unsigned int len)
 {
         if (skb_padto(skb, len))
@@ -15977,6 +15672,7 @@ static bool rtl8126_skb_pad_with_len(struct sk_buff *skb, unsigned int len)
         skb_put(skb, len - skb->len);
         return true;
 }
+#endif //LINUX_VERSION_CODE < KERNEL_VERSION(3,19,0)
 
 static bool rtl8126_skb_pad(struct sk_buff *skb)
 {
@@ -16012,70 +15708,6 @@ static int msdn_giant_send_check(struct sk_buff *skb)
 }
 #endif
 
-static bool rtl8126_require_pad_ptp_pkt(struct rtl8126_private *tp)
-{
-        return false;
-}
-
-#define MIN_PATCH_LEN (47)
-static u32
-rtl8126_get_patch_pad_len(struct rtl8126_private *tp,
-                          struct sk_buff *skb)
-{
-        u32 pad_len = 0;
-        int trans_data_len;
-        u32 hdr_len;
-        u32 pkt_len = skb->len;
-        u8 ip_protocol;
-        bool has_trans = skb_transport_header_was_set(skb);
-
-        if (!rtl8126_require_pad_ptp_pkt(tp))
-                goto no_padding;
-
-        if (!(has_trans && (pkt_len < 175))) //128 + MIN_PATCH_LEN
-                goto no_padding;
-
-        ip_protocol = rtl8126_get_l4_protocol(skb);
-        if (!(ip_protocol == IPPROTO_TCP || ip_protocol == IPPROTO_UDP))
-                goto no_padding;
-
-        trans_data_len = pkt_len -
-                         (skb->transport_header -
-                          skb_headroom(skb));
-        if (ip_protocol == IPPROTO_UDP) {
-                if (trans_data_len > 3 && trans_data_len < MIN_PATCH_LEN) {
-                        u16 dest_port = 0;
-
-                        skb_copy_bits(skb, skb->transport_header - skb_headroom(skb) + 2, &dest_port, 2);
-                        dest_port = ntohs(dest_port);
-
-                        if (dest_port == 0x13f ||
-                            dest_port == 0x140) {
-                                pad_len = MIN_PATCH_LEN - trans_data_len;
-                                goto out;
-                        }
-                }
-        }
-
-        hdr_len = 0;
-        if (ip_protocol == IPPROTO_TCP)
-                hdr_len = 20;
-        else if (ip_protocol == IPPROTO_UDP)
-                hdr_len = 8;
-        if (trans_data_len < hdr_len)
-                pad_len = hdr_len - trans_data_len;
-
-out:
-        if ((pkt_len + pad_len) < ETH_ZLEN)
-                pad_len = ETH_ZLEN - pkt_len;
-
-        return pad_len;
-
-no_padding:
-
-        return 0;
-}
-
 static bool
 rtl8126_tso_csum(struct sk_buff *skb,
                  struct net_device *dev,
@@ -16087,7 +15719,6 @@ rtl8126_tso_csum(struct sk_buff *skb,
         unsigned long large_send = 0;
         u32 csum_cmd = 0;
         u8 sw_calc_csum = false;
-        u8 check_patch_required = true;
 
 #if LINUX_VERSION_CODE > KERNEL_VERSION(2,6,0)
         if (dev->features & (NETIF_F_TSO | NETIF_F_TSO6)) {
@@ -16205,21 +15836,6 @@ rtl8126_tso_csum(struct sk_buff *skb,
 #if LINUX_VERSION_CODE > KERNEL_VERSION(2,6,0)
                         WARN_ON(1); /* we need a WARN() */
 #endif
-                }
-
-                if (ip_protocol == IPPROTO_TCP)
-                        check_patch_required = false;
-        }
-
-        if (check_patch_required) {
-                u32 pad_len = rtl8126_get_patch_pad_len(tp, skb);
-
-                if (pad_len > 0) {
-                        if (!rtl8126_skb_pad_with_len(skb, skb->len + pad_len))
-                                return false;
-
-                        if (csum_cmd != 0)
-                                sw_calc_csum = true;
                 }
         }
 
@@ -16488,7 +16104,7 @@ rtl8126_tx_interrupt_noclose(struct rtl8126_tx_ring *ring, int budget)
                 WRITE_ONCE(ring->dirty_tx, dirty_tx);
                 smp_wmb();
                 if (__netif_subqueue_stopped(dev, ring->index) &&
-                    (rtl8126_tx_slots_avail(tp, ring))) {
+                    rtl8126_tx_slots_avail(tp, ring) && netif_carrier_ok(dev)) {
                         netif_start_subqueue(dev, ring->index);
                 }
         }
@@ -16545,7 +16161,7 @@ rtl8126_tx_interrupt_close(struct rtl8126_tx_ring *ring, int budget)
                 WRITE_ONCE(ring->dirty_tx, dirty_tx);
                 smp_wmb();
                 if (__netif_subqueue_stopped(dev, ring->index) &&
-                    (rtl8126_tx_slots_avail(tp, ring))) {
+                    rtl8126_tx_slots_avail(tp, ring) && netif_carrier_ok(dev)) {
                         netif_start_subqueue(dev, ring->index);
                 }
 
@@ -17000,6 +16616,10 @@ rtl8126_rx_interrupt(struct net_device *dev,
                         if (!R8126_USE_NAPI_ALLOC_SKB)
                                 skb_reserve(skb, R8126_RX_ALIGN);
                         skb_put(skb, pkt_size);
+#ifdef ENABLE_RSS_SUPPORT
+                        rtl8126_rx_hash(tp, desc, skb);
+#endif
+                        rtl8126_rx_csum(tp, skb, desc);
                 } else
                         skb_add_rx_frag(skb, skb_shinfo(skb)->nr_frags, rxb->page,
                                         rxb->page_offset, pkt_size, tp->rx_buf_page_size / 2);
@@ -17052,10 +16672,12 @@ rtl8126_rx_interrupt(struct net_device *dev,
                 }
 #endif //ENABLE_RX_PACKET_FRAGMENT
 
+#ifndef ENABLE_PAGE_REUSE
 #ifdef ENABLE_RSS_SUPPORT
                 rtl8126_rx_hash(tp, desc, skb);
 #endif
                 rtl8126_rx_csum(tp, skb, desc);
+#endif /* !ENABLE_PAGE_REUSE */
 
                 skb->protocol = eth_type_trans(skb, dev);
 
@@ -17192,28 +16814,6 @@ static irqreturn_t rtl8126_interrupt(int irq, void *dev_instance)
 
                 if (rtl8126_linkchg_interrupt(tp, status))
                         rtl8126_schedule_linkchg_work(tp);
-
-#ifdef ENABLE_DASH_SUPPORT
-                if (tp->DASH) {
-                        if (HW_DASH_SUPPORT_TYPE_3(tp)) {
-                                u8 DashIntType2Status;
-
-                                if (status & ISRIMR_DASH_INTR_CMAC_RESET)
-                                        tp->CmacResetIntr = TRUE;
-
-                                DashIntType2Status = RTL_CMAC_R8(tp, CMAC_IBISR0);
-                                if (DashIntType2Status & ISRIMR_DASH_TYPE2_ROK)
-                                        tp->RcvFwDashOkEvt = TRUE;
-                                if (DashIntType2Status & ISRIMR_DASH_TYPE2_TOK)
-                                        tp->SendFwHostOkEvt = TRUE;
-                                if (DashIntType2Status & ISRIMR_DASH_TYPE2_RX_DISABLE_IDLE)
-                                        tp->DashFwDisableRx = TRUE;
-
-                                RTL_CMAC_W8(tp, CMAC_IBISR0, DashIntType2Status);
-                        }
-                }
-#endif
-
 #ifdef CONFIG_R8126_NAPI
                 if (status & tp->intr_mask || tp->keep_intr_cnt-- > 0) {
                         if (status & tp->intr_mask)
@@ -17244,14 +16844,6 @@ static irqreturn_t rtl8126_interrupt(int irq, void *dev_instance)
 #else
                         rtl8126_rx_interrupt(dev, tp, &tp->rx_ring[0], budget);
 #endif	//LINUX_VERSION_CODE < KERNEL_VERSION(2,6,24)
-
-#ifdef ENABLE_DASH_SUPPORT
-                        if (tp->DASH) {
-                                struct net_device *dev = tp->dev;
-
-                                HandleDashInterrupt(dev);
-                        }
-#endif
 
                         rtl8126_switch_to_timer_interrupt(tp);
                 } else {
@@ -17396,9 +16988,6 @@ static void rtl8126_shutdown(struct pci_dev *pdev)
 
         rtnl_lock();
 
-        if (HW_DASH_SUPPORT_DASH(tp))
-                rtl8126_driver_stop(tp);
-
         rtl8126_disable_pci_offset_180(tp);
 
         if (s5_keep_curr_mac == 0 && tp->random_mac == 0)
@@ -17468,9 +17057,6 @@ rtl8126_suspend(struct pci_dev *pdev, pm_message_t state)
         rtl8126_powerdown_pll(dev, 1);
 
 out:
-        if (HW_DASH_SUPPORT_DASH(tp))
-                rtl8126_driver_stop(tp);
-
         rtnl_unlock();
 
         pci_disable_device(pdev);
@@ -17504,7 +17090,7 @@ static int rtl8126_wait_phy_nway_complete_sleep(struct rtl8126_private *tp)
                 if (val)
                         return 0;
 
-                fsleep(100000);
+                mdelay(100);
         }
 
         return -1;
@@ -17528,6 +17114,7 @@ rtl8126_resume(struct device *device)
 #if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,10)
         u32 pci_pm_state = PCI_D0;
 #endif
+        unsigned long flags;
         u32 err;
 
         rtnl_lock();
@@ -17547,12 +17134,16 @@ rtl8126_resume(struct device *device)
         /* restore last modified mac address */
         rtl8126_rar_set(tp, dev->dev_addr);
 
+        r8126_spin_lock(&tp->phy_lock, flags);
+
         tp->resume_not_chg_speed = 0;
         if (tp->check_keep_link_speed &&
             //tp->link_ok(dev) &&
             rtl8126_hw_d3_not_power_off(dev) &&
             rtl8126_wait_phy_nway_complete_sleep(tp) == 0)
                 tp->resume_not_chg_speed = 1;
+
+        r8126_spin_unlock(&tp->phy_lock, flags);
 
         if (!netif_running(dev))
                 goto out_unlock;
