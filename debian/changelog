@@ -1,3 +1,9 @@
+realtek-r8126-dkms (10.017.00-1) stable; urgency=medium
+
+  * Update Realtek r8126 driver to 10.017.00
+
+ -- Edgar Aroutionian <edgar.factorial@gmail.com>  Fri, 29 May 2026 22:05:56 +0900
+
 realtek-r8126-dkms (10.016.00-1) stable; urgency=medium
 
   * Update Realtek r8126 driver to 10.016.00
