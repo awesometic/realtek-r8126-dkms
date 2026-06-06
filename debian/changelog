@@ -1,3 +1,9 @@
+realtek-r8126-dkms (10.017.00-1) stable; urgency=medium
+
+  * Update Realtek r8126 driver to 10.017.00
+
+ -- anrp <anrp@anrp.net>  Sat, 06 Jun 2026 10:51:27 -0400
+
 realtek-r8126-dkms (10.016.00-1) stable; urgency=medium
 
   * Update Realtek r8126 driver to 10.016.00
