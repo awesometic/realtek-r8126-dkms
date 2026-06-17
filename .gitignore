@@ -1,0 +1,7 @@
+# Debian package build outputs
+/debian/.debhelper/
+/debian/debhelper-build-stamp
+/debian/files
+/debian/*.debhelper.log
+/debian/*.substvars
+/debian/realtek-r8126-dkms/
