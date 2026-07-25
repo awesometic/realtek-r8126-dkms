@@ -9,6 +9,11 @@ name: Draft release
 permissions:
   contents: write
 
+env:
+  PACKAGE_NAME: realtek-r8126-dkms
+  VERSION_HEADER: src/r8126.h
+  VERSION_MACRO: RTL8126_VERSION
+
 concurrency:
   group: draft-release-${{ github.ref }}
   cancel-in-progress: false
@@ -38,9 +43,9 @@ jobs:
             exit 1
           }
 
-          driver_versions="$(sed -nE 's/^[[:space:]]*#define[[:space:]]+RTL8126_VERSION[[:space:]]+"([^"]+)".*$/\1/p' src/r8126.h)"
+          driver_versions="$(sed -nE "s/^[[:space:]]*#define[[:space:]]+${VERSION_MACRO}[[:space:]]+\"([^\"]+)\".*$/\1/p" "$VERSION_HEADER")"
           driver_version_count="$(printf '%s\n' "$driver_versions" | sed '/^$/d' | wc -l)"
-          [ "$driver_version_count" -eq 1 ] || fail "Expected exactly one RTL8126_VERSION definition in src/r8126.h, found $driver_version_count."
+          [ "$driver_version_count" -eq 1 ] || fail "Expected exactly one $VERSION_MACRO definition in $VERSION_HEADER, found $driver_version_count."
           driver_version="$driver_versions"
 
           check_single_version() {
@@ -73,7 +78,7 @@ jobs:
           prerm_versions="$(sed -nE 's/^VERSION=([^[:space:]]+).*$/\1/p' debian/prerm)"
           check_single_version "debian/prerm VERSION" "$prerm_versions" "$driver_version"
 
-          readme_package_versions="$(sed -nE 's/.*realtek-r8126-dkms_([^_]+)_.*\.deb.*/\1/p' README.md)"
+          readme_package_versions="$(sed -nE "s/.*${PACKAGE_NAME}_([^_]+)_.*\.deb.*/\1/p" README.md)"
           readme_version_count="$(printf '%s\n' "$readme_package_versions" | sed '/^$/d' | wc -l)"
           [ "$readme_version_count" -ge 1 ] || fail "Expected at least one README.md Debian package version reference."
           while IFS= read -r readme_package_version; do
@@ -127,7 +132,7 @@ jobs:
           set -euo pipefail
 
           shopt -s nullglob
-          deb_packages=(../realtek-r8126-dkms_"$PACKAGE_VERSION"_*.deb)
+          deb_packages=(../"${PACKAGE_NAME}"_"$PACKAGE_VERSION"_*.deb)
           [ "${#deb_packages[@]}" -eq 1 ] || {
             echo "::error::Expected exactly one Debian package asset for version $PACKAGE_VERSION, found ${#deb_packages[@]}."
             exit 1
