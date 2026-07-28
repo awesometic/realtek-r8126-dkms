@@ -458,6 +458,13 @@ do { \
 
 #if !defined(HAVE_FREE_NETDEV) && (LINUX_VERSION_CODE < KERNEL_VERSION(3,1,0))
 #define free_netdev(x)  kfree(x)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,27)
+#define RTL_NAPI_DEL(priv)
+#else
+#define RTL_NAPI_DEL(priv)   netif_napi_del(&priv->napi)
+#endif //LINUX_VERSION_CODE < KERNEL_VERSION(2,6,27)
+#else
+#define RTL_NAPI_DEL(priv)
 #endif
 
 #ifndef SET_NETDEV_DEV
@@ -640,12 +647,12 @@ static inline u32 rtl8126_ethtool_adv_to_mmd_eee_adv_cap2_t(u32 adv)
 #define RSS_SUFFIX ""
 #endif
 
-#define RTL8126_VERSION "10.017.00" NAPI_SUFFIX REALWOW_SUFFIX PTP_SUFFIX RSS_SUFFIX
+#define RTL8126_VERSION "10.018.00" NAPI_SUFFIX REALWOW_SUFFIX PTP_SUFFIX RSS_SUFFIX
 #define MODULENAME "r8126"
 #define PFX MODULENAME ": "
 
 #define GPL_CLAIM "\
-r8126  Copyright (C) 2025 Realtek NIC software team <nicfae@realtek.com> \n \
+r8126  Copyright (C) 2026 Realtek NIC software team <nicfae@realtek.com> \n \
 This program comes with ABSOLUTELY NO WARRANTY; for details, please see <http://www.gnu.org/licenses/>. \n \
 This is free software, and you are welcome to redistribute it under certain conditions; see <http://www.gnu.org/licenses/>. \n"
 
@@ -982,12 +989,6 @@ typedef int napi_budget;
 #define RTL_NAPI_ENABLE(dev, napi)          napi_enable(napi)
 #define RTL_NAPI_DISABLE(dev, napi)         napi_disable(napi)
 #endif  //LINUX_VERSION_CODE < KERNEL_VERSION(2,6,24)
-
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,27)
-#define RTL_NAPI_DEL(priv)
-#else
-#define RTL_NAPI_DEL(priv)   netif_napi_del(&priv->napi)
-#endif //LINUX_VERSION_CODE < KERNEL_VERSION(2,6,27)
 
 /*****************************************************************************/
 #ifdef CONFIG_R8126_NAPI
@@ -2766,6 +2767,25 @@ struct rtl8126_private {
         u16 MacMcuPageSize;
         u64 hw_mcu_patch_code_ver;
         u64 bin_mcu_patch_code_ver;
+        u16 hw_mcu_patch_code_bp_en;
+        u16 sw_mcu_patch_code_bp_en;
+
+        /* module parameters (per-instance copy) */
+        u8   use_dac;
+        u32  timer_count;
+        u32  speed_mode;
+        u32  duplex_mode;
+        u32  autoneg_mode;
+        u8   aspm;
+        u8   s5wol;
+        u8   s5_keep_curr_mac;
+        ulong hwoptimize;
+        u8   s0_magic_packet;
+        u8   tx_no_close_enable;
+        u8   disable_wol_support;
+        u8   enable_double_vlan;
+        u8   enable_giga_lite;
+
         u8 hw_has_mac_mcu_patch_code;
 
         u8 HwSuppTcamVer;

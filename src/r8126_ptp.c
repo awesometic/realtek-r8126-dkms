@@ -5,7 +5,7 @@
 # r8126 is the Linux device driver released for Realtek 5 Gigabit Ethernet
 # controllers with PCI-Express interface.
 #
-# Copyright(c) 2025 Realtek Semiconductor Corp. All rights reserved.
+# Copyright(c) 2026 Realtek Semiconductor Corp. All rights reserved.
 #
 # This program is free software; you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by the Free
@@ -293,6 +293,8 @@ static int rtl8126_phc_settime(struct ptp_clock_info *ptp,
         return ret;
 }
 
+#define R8126_PPS_TIMER_INTERVAL 1000000000
+
 static void _rtl8126_phc_enable(struct ptp_clock_info *ptp,
                                 struct ptp_clock_request *rq, int on)
 {
@@ -327,7 +329,7 @@ static void _rtl8126_phc_enable(struct ptp_clock_info *ptp,
                 r8126_spin_unlock(&tp->phy_lock, flags);
 
                 /* start hrtimer */
-                hrtimer_start(&tp->pps_timer, 1000000000, HRTIMER_MODE_REL);
+                hrtimer_start(&tp->pps_timer, ktime_set(0, R8126_PPS_TIMER_INTERVAL), HRTIMER_MODE_REL);
         } else
                 tp->pps_enable = 0;
 }
@@ -721,7 +723,7 @@ rtl8126_hrtimer_for_pps(struct hrtimer *timer) {
 
                 r8126_spin_unlock(&tp->phy_lock, flags);
 
-                hrtimer_forward_now(&tp->pps_timer, 1000000000); //rekick
+                hrtimer_forward_now(&tp->pps_timer, ktime_set(0, R8126_PPS_TIMER_INTERVAL)); //rekick
                 return HRTIMER_RESTART;
         } else
                 return HRTIMER_NORESTART;

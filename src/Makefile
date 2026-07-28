@@ -4,7 +4,7 @@
 # r8126 is the Linux device driver released for Realtek 5 Gigabit Ethernet
 # controllers with PCI-Express interface.
 #
-# Copyright(c) 2025 Realtek Semiconductor Corp. All rights reserved.
+# Copyright(c) 2026 Realtek Semiconductor Corp. All rights reserved.
 #
 # This program is free software; you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by the Free
@@ -48,7 +48,7 @@ ENABLE_USE_FIRMWARE_FILE = n
 DISABLE_WOL_SUPPORT = n
 DISABLE_MULTI_MSIX_VECTOR = n
 ENABLE_DOUBLE_VLAN = n
-ENABLE_PAGE_REUSE = n
+ENABLE_PAGE_REUSE = y
 ENABLE_RX_PACKET_FRAGMENT = n
 ENABLE_GIGA_LITE = y
 
