@@ -15512,6 +15512,9 @@ _rtl8126_start_xmit(struct sk_buff *skb,
 
                                 tp->ptp_tx_skb = skb_get(skb);
                                 tp->ptp_tx_start = jiffies;
+                                /* discard events of frames sent before this one */
+                                RTL_W8(tp, PTP_ISR_8125,
+                                       PTP_ISR_TOK | PTP_ISR_TER);
                                 schedule_work(&tp->ptp_tx_work);
                         } else
                                 tp->tx_hwtstamp_skipped++;
