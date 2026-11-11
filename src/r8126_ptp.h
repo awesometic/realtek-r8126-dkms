@@ -115,6 +115,21 @@ enum PTP_TRX_TS_STA_REG {
 #define PTP_CTL_TYPE_2 (0x0FF)
 #define PTP_CTL_TYPE_3 (0x03F)
 
+/*
+ * MAC side PTP block (BAR offsets PTP_CTRL_8125 .. PTP_LOCAL_Time_8125).
+ * Bit names follow the equivalent RTL8125 register.
+ */
+enum PTP_CTRL_TYPE {
+        PTP_ENABLE              = (1 << 0),
+        PTP_INT_EN              = (1 << 2),
+        PTP_TS_ONLY_PTP_EVENTS  = (1 << 3),
+        PTP_INT_TS_ERR_INT_EN   = (1 << 4),
+        PTP_TS_ON_TRIGGER_PHY   = (1 << 6),
+        PTP_TX_EVENT_EN         = (1 << 10),
+        PTP_PKT_EVENT_FCF_FILTER = (1 << 12),
+        PTP_TX_UNORDERED        = (1 << 13),
+};
+
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5,10,0)
 struct clock_identity {
         u8 id[8];

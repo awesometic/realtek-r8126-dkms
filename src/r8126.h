@@ -2750,6 +2750,11 @@ struct rtl8126_private {
         u8 syncE_en;
         u8 pps_enable;
         struct hrtimer pps_timer;
+        u8 ptp_mac_tx_en;
+        u8 ptp_mac_off_valid;
+        s32 ptp_mac_rate;
+        s64 ptp_mac_off;
+        u64 ptp_mac_rate_time;
 #endif
 
         u8 HwSuppRssVer;

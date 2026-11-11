@@ -64,34 +64,218 @@ static void rtl8126_set_clkadj_mode(struct rtl8126_private *tp, u16 cmd)
         rtl8126_wait_clkadj_ready(tp);
 }
 
+/*
+ * Two clocks are involved in time stamping.  The PHC handed to the PTP stack is
+ * the PTP clock of the PHY (PHY OCP 0xE412..0xE41A); received frames are
+ * captured with it, which the PHY does exactly.  Transmitted frames are
+ * captured by the MAC side PTP block (see rtl8126_ptp_mac_tx_enable), which
+ * counts on a counter of its own (0x6818/0x681C) that a pair of MMIO reads
+ * reaches, so the time stamp of a transmitted frame has to be moved over into
+ * the time base of the PHC.
+ *
+ * Moving it over needs the difference between the two clocks, and looking that
+ * difference up is not a harmless operation: the PHY clock is fetched with a
+ * handful of MDIO transactions that together take tens of microseconds and,
+ * with the port busy, do not take the same amount of time twice.  A time stamp
+ * converted with a reading taken just then inherits that jitter.  So the
+ * difference is not looked up when a time stamp is made but kept as a model
+ * that is carried along, and the only thing a time stamp costs is the pair of
+ * MMIO reads of the egress capture:
+ *
+ *   - both counters are divided from a clock of the chip and keep step by
+ *     themselves; measured with the frequency adjustment idle, they drift apart
+ *     by well below a part in 10^6,
+ *   - the one thing that moves the difference on purpose is the frequency
+ *     adjustment, which slews the PHY clock and leaves the MAC one alone.  The
+ *     adjustment reaches the PHY as a signed fixed point rate (2^32 being one),
+ *     so its effect on the difference is known exactly and is integrated into
+ *     the model at the moment it is applied,
+ *   - a step of the PHC is known exactly as well and is added to the model
+ *     directly, which matters because a servo that steps instead of slewing
+ *     would otherwise invalidate the model over and over,
+ *   - what is left, the part per million the counters do run apart by and
+ *     whatever the readings were off by, is corrected by pulling the model a
+ *     fraction of the way towards each new pair of readings.  Individual
+ *     readings are worth microseconds, their trend is worth nanoseconds.
+ */
+static u64 rtl8126_ptp_mac_time(struct rtl8126_private *tp, u32 ns_reg, u32 s_reg)
+{
+        u32 ns1, ns2;
+        u64 sec;
+
+        ns1 = (u32)RTL_R32(tp, ns_reg) & 0x3fffffff;
+        sec = (u32)RTL_R32(tp, s_reg);
+        ns2 = (u32)RTL_R32(tp, ns_reg) & 0x3fffffff;
+
+        /* the nanoseconds field rolls over every second */
+        if (ns2 < ns1)
+                sec++;
+
+        return sec * 1000000000ULL + ns2;
+}
+
+/* the local counter of the MAC PTP block */
+static u64 rtl8126_ptp_mac_now(struct rtl8126_private *tp)
+{
+        return rtl8126_ptp_mac_time(tp, PTP_LOCAL_Time_NS_8125,
+                                    PTP_LOCAL_Time_S_8125);
+}
+
+/*
+ * The model: the difference between the clocks (PHC minus MAC) as it is
+ * expected at MAC time mac.  ptp_mac_off is the difference as of
+ * ptp_mac_rate_time and ptp_mac_rate, the rate the PHY was last told to run at,
+ * has been in effect since.
+ */
+static s64 rtl8126_ptp_mac_off_at(struct rtl8126_private *tp, u64 mac)
+{
+        s64 span;
+
+        if (!tp->ptp_mac_off_valid)
+                return 0;
+
+        if (time_before64(mac, tp->ptp_mac_rate_time))
+                span = 0;
+        else
+                span = (s64)(mac - tp->ptp_mac_rate_time);
+
+        return tp->ptp_mac_off + ((span * (s64)tp->ptp_mac_rate) >> 32);
+}
+
+/*
+ * Fold in what the rate in effect has done to the difference since it was
+ * applied, so that the stored difference is again the difference as of now.
+ * Called with phy_lock held and whenever the rate or the PHC is touched, which
+ * is why the rate never has to be integrated over a long span and why a change
+ * of the frequency in between cannot be missed.
+ */
+static void rtl8126_ptp_mac_fold(struct rtl8126_private *tp)
+{
+        u64 mac;
+
+        if (!tp->ptp_mac_tx_en)
+                return;
+
+        mac = rtl8126_ptp_mac_now(tp);
+
+        if (tp->ptp_mac_off_valid && time_after64(mac, tp->ptp_mac_rate_time))
+                tp->ptp_mac_off = rtl8126_ptp_mac_off_at(tp, mac);
+
+        tp->ptp_mac_rate_time = mac;
+}
+
+/*
+ * Use a pair of readings to pull the model: phy as the PHY clock reports it,
+ * mac as the MAC clock stood when the PHY was asked for its time.  A pair is
+ * worth microseconds on its own because the PHY registers are fetched one by
+ * one over the MDIO bus, so only the slow trend of the pairs is followed; the
+ * correction one reading brings in is taken a fraction at a time.
+ *
+ * A pair is thrown away instead of being corrected for when it cannot be
+ * trusted at all: a difference that moved by far more than a reading is ever
+ * off by is a step of one of the two clocks, and the counter of the MAC block
+ * starts from zero again when the block is reset, which the link going down
+ * does.  Call with phy_lock held.
+ */
+#define RTL8126_PTP_MAC_STEP      1000000000LL   /* 1 s: a step, not a reading */
+#define RTL8126_PTP_MAC_MAXPULL     10000000LL   /* 10 ms per reading */
+#define RTL8126_PTP_MAC_PULLDIV           32     /* ~32 readings to converge */
+
+static void rtl8126_ptp_mac_off_update(struct rtl8126_private *tp, u64 phy, u64 mac)
+{
+        s64 sample, err, folded;
+
+        if (!tp->ptp_mac_tx_en)
+                return;
+
+        if (time_before64(mac, tp->ptp_mac_rate_time))
+                tp->ptp_mac_off_valid = 0;
+
+        sample = (s64)phy - (s64)mac;
+        err = sample - rtl8126_ptp_mac_off_at(tp, mac);
+
+        if (!tp->ptp_mac_off_valid || err > RTL8126_PTP_MAC_STEP ||
+            err < -RTL8126_PTP_MAC_STEP) {
+                tp->ptp_mac_off = sample;
+                tp->ptp_mac_rate_time = mac;
+                tp->ptp_mac_off_valid = 1;
+                return;
+        }
+
+        folded = rtl8126_ptp_mac_off_at(tp, mac);
+
+        if (err > RTL8126_PTP_MAC_MAXPULL)
+                err = RTL8126_PTP_MAC_MAXPULL;
+        else if (err < -RTL8126_PTP_MAC_MAXPULL)
+                err = -RTL8126_PTP_MAC_MAXPULL;
+
+        tp->ptp_mac_off = folded + div_s64(err, RTL8126_PTP_MAC_PULLDIV);
+        tp->ptp_mac_rate_time = mac;
+}
+
+/*
+ * Ask the PHY to copy its clock into the readable registers and take the MAC
+ * clock for that same instant: the copy happens as the command reaches the PHY,
+ * so the MAC clock is read straight after the MDIO write that carries the
+ * command has completed and nothing else that takes an uneven amount of time is
+ * left in between.  Call with phy_lock held.  Returns the MAC clock.
+ */
+static u64 rtl8126_ptp_clk_snapshot(struct rtl8126_private *tp)
+{
+        u64 mac = 0;
+        u16 val;
+
+        val = (u16)rtl8126_mdio_direct_read_phy_ocp(tp, PTP_CLK_CFG_8126);
+        rtl8126_mdio_direct_write_phy_ocp(tp, PTP_CLK_CFG_8126,
+                                          (val & ~(BIT_3 | BIT_2 | BIT_1)) |
+                                          CLKADJ_MODE_SET | DIRECT_READ);
+
+        if (tp->ptp_mac_tx_en)
+                mac = rtl8126_ptp_mac_now(tp);
+
+        rtl8126_wait_clkadj_ready(tp);
+
+        return mac;
+}
+
 static int _rtl8126_phc_gettime(struct rtl8126_private *tp, struct timespec64 *ts64)
 {
         unsigned long flags;
+        u32 nsec;
+        u64 mac, sec, phy;
 
         r8126_spin_lock(&tp->phy_lock, flags);
 
         //Direct Read
-        rtl8126_set_clkadj_mode(tp, DIRECT_READ);
+        mac = rtl8126_ptp_clk_snapshot(tp);
 
         /* nanoseconds */
         //Ns[29:16] E414[13:0]
-        ts64->tv_nsec = rtl8126_mdio_direct_read_phy_ocp(tp, PTP_CFG_NS_HI_8126) & 0x3fff;
-        ts64->tv_nsec <<= 16;
+        nsec = rtl8126_mdio_direct_read_phy_ocp(tp, PTP_CFG_NS_HI_8126) & 0x3fff;
+        nsec <<= 16;
         //Ns[15:0]  E412[15:0]
-        ts64->tv_nsec |= rtl8126_mdio_direct_read_phy_ocp(tp, PTP_CFG_NS_LO_8126);
-
+        nsec |= rtl8126_mdio_direct_read_phy_ocp(tp, PTP_CFG_NS_LO_8126);
 
         /* seconds */
         //S[47:32] E41A[15:0]
-        ts64->tv_sec = rtl8126_mdio_direct_read_phy_ocp(tp, PTP_CFG_S_HI_8126);
-        ts64->tv_sec <<= 16;
+        sec = rtl8126_mdio_direct_read_phy_ocp(tp, PTP_CFG_S_HI_8126);
+        sec <<= 16;
         //S[31:16] E418[15:0]
-        ts64->tv_sec |= rtl8126_mdio_direct_read_phy_ocp(tp, PTP_CFG_S_MI_8126);
-        ts64->tv_sec <<= 16;
+        sec |= rtl8126_mdio_direct_read_phy_ocp(tp, PTP_CFG_S_MI_8126);
+        sec <<= 16;
         //S[15:0]  E416[15:0]
-        ts64->tv_sec |= rtl8126_mdio_direct_read_phy_ocp(tp, PTP_CFG_S_LO_8126);
+        sec |= rtl8126_mdio_direct_read_phy_ocp(tp, PTP_CFG_S_LO_8126);
+
+        phy = sec * 1000000000ULL + nsec;
+
+        rtl8126_ptp_mac_off_update(tp, phy, mac);
 
         r8126_spin_unlock(&tp->phy_lock, flags);
+
+        /* nanoseconds */
+        ts64->tv_nsec = nsec;
+        /* seconds */
+        ts64->tv_sec = (time64_t)sec;
 
         return 0;
 }
@@ -118,6 +302,9 @@ static int _rtl8126_phc_settime(struct rtl8126_private *tp, const struct timespe
 
         //Direct Write
         rtl8126_set_clkadj_mode(tp, DIRECT_WRITE);
+
+        /* the PHC went somewhere unknown, the model has to be rebuilt */
+        tp->ptp_mac_off_valid = 0;
 
         r8126_spin_unlock(&tp->phy_lock, flags);
 
@@ -165,10 +352,16 @@ static int _rtl8126_phc_adjtime(struct rtl8126_private *tp, s64 delta)
         //S[47:32] E41A[15:0]
         rtl8126_mdio_direct_write_phy_ocp(tp, PTP_CFG_S_HI_8126, (sec >> 32));
 
+        /* the step is known, so is its effect on the difference between the
+         * two clocks: the MAC clock is not stepped along with the PHY one */
+        rtl8126_ptp_mac_fold(tp);
+
         if (negative)
                 rtl8126_set_clkadj_mode(tp, DECREMENT_STEP);
         else
                 rtl8126_set_clkadj_mode(tp, INCREMENT_STEP);
+
+        tp->ptp_mac_off += delta;
 
         r8126_spin_unlock(&tp->phy_lock, flags);
 
@@ -215,7 +408,13 @@ static int _rtl8126_phc_adjfreq(struct ptp_clock_info *ptp, s32 ppb)
         //Ns[22:16] E414[13:0]
         rtl8126_mdio_direct_write_phy_ocp(tp, PTP_CFG_NS_HI_8126, (rate_value & 0x003f0000) >> 16);
 
+        /* what the rate in effect has made of the difference so far is folded
+         * into the model right before the new rate takes over */
+        rtl8126_ptp_mac_fold(tp);
+
         rtl8126_set_clkadj_mode(tp, RATE_WRITE);
+
+        tp->ptp_mac_rate = (s32)rate_value;
 
         r8126_spin_unlock(&tp->phy_lock, flags);
 
@@ -422,28 +621,31 @@ static const struct ptp_clock_info rtl_ptp_clock_info = {
         .enable     = rtl8126_phc_enable,
 };
 
-static u16 rtl8126_ptp_get_tx_msgtype(struct rtl8126_private *tp)
+/*
+ * The PHY PTP engine (OCP 0xE4xx) timestamps the PTP frames it receives, but it
+ * never captures the ones this NIC transmits: neither INSR.TX_TS_INTR nor any
+ * TX_TS_*_RDY bit of PTP_TRX_TS_STA is ever posted for transmitted frames, so
+ * the egress latch registers keep whatever the last RX capture left there.
+ *
+ * The MAC side PTP block does see them.  Once it is enabled it posts PTP_ISR_TOK
+ * as soon as a PTP frame has left the port and stores the instant of egress in
+ * its PTP_SOFT_CONFIG_Time_* registers, where it stays until the next PTP frame
+ * is sent.  Note that the block runs on a clock of its own which is *not* the
+ * clock the PHC exposes, so only differences between the two may be used.
+ */
+static void rtl8126_ptp_mac_tx_enable(struct rtl8126_private *tp, bool enable)
 {
-        u16 tx_ts_ready = 0;
-        int i;
-
-        for (i = 0; i < R8126_CHANNEL_WAIT_COUNT; i++) {
-                tx_ts_ready = rtl8126_mdio_direct_read_phy_ocp(tp, PTP_TRX_TS_STA) & 0xF000;
-                if (tx_ts_ready)
-                        break;
+        if (enable) {
+                RTL_W8(tp, PTP_ISR_8125, PTP_ISR_TOK | PTP_ISR_TER);
+                RTL_W16(tp, PTP_CTRL_8125, PTP_ENABLE | PTP_TS_ONLY_PTP_EVENTS |
+                           PTP_TX_EVENT_EN);
+        } else {
+                RTL_W16(tp, PTP_CTRL_8125, 0);
         }
 
-        switch (tx_ts_ready) {
-        case TX_TS_PDLYRSP_RDY:
-                return PTP_MSGTYPE_PDELAY_RESP;
-        case TX_TS_PDLYREQ_RDY:
-                return PTP_MSGTYPE_PDELAY_REQ;
-        case TX_TS_DLYREQ_RDY:
-                return PTP_MSGTYPE_DELAY_REQ;
-        case TX_TS_SYNC_RDY:
-        default:
-                return PTP_MSGTYPE_SYNC;
-        }
+        /* its counter starts from zero again, so has its relation to the PHC */
+        tp->ptp_mac_tx_en = enable ? 1 : 0;
+        tp->ptp_mac_off_valid = 0;
 }
 
 /*
@@ -491,35 +693,50 @@ static void rtl8126_set_trx_ts_cmd(struct rtl8126_private *tp, u16 cmd)
         rtl8126_wait_trx_ts_ready(tp);
 }
 
-static void rtl8126_ptp_egresstime(struct rtl8126_private *tp, struct timespec64 *ts64)
+/*
+ * Turn the egress instant the MAC PTP block captured into a time stamp in the
+ * time base of the PHC.  The converting is done with the model of the
+ * difference between the two clocks, not with a reading of them taken here, so
+ * the time stamp of a transmitted frame does not inherit the time the MDIO bus
+ * happens to need at the moment.
+ */
+static void rtl8126_ptp_tx_egresstime(struct rtl8126_private *tp, struct timespec64 *ts64)
 {
-        u16 msgtype;
+        struct timespec64 ref;
+        u64 egress, mac;
+        s64 ts, off;
 
-        msgtype = rtl8126_ptp_get_tx_msgtype(tp);
+        egress = rtl8126_ptp_mac_time(tp, PTP_SOFT_CONFIG_Time_NS_8125,
+                                      PTP_SOFT_CONFIG_Time_S_8125);
+        mac = rtl8126_ptp_mac_now(tp);
 
-        msgtype <<= 2;
+        /*
+         * The counter of the MAC block starts over from zero when the block is
+         * reset, which the link going down does, and the egress capture of a
+         * frame that has not been time stamped is the one of the frame before:
+         * either way the model does not describe the clocks any more.  Note
+         * that this is looked at before the clocks are read again, so that the
+         * reading rebuilds the model rather than nudging a broken one.
+         */
+        if (!tp->ptp_mac_off_valid || time_before64(mac, tp->ptp_mac_rate_time) ||
+            egress + 1000000000ULL < mac)
+                tp->ptp_mac_off_valid = 0;
 
-        rtl8126_set_trx_ts_cmd(tp, (msgtype | BIT_4));
+        /* nudge the model along with a fresh pair of clock readings */
+        _rtl8126_phc_gettime(tp, &ref);
 
-        /* nanoseconds */
-        //Ns[29:16] E448[13:0]
-        ts64->tv_nsec = rtl8126_mdio_direct_read_phy_ocp(tp, PTP_TRX_TS_NS_HI) & 0x3fff;
-        ts64->tv_nsec <<= 16;
-        //Ns[15:0]  E446[15:0]
-        ts64->tv_nsec |= rtl8126_mdio_direct_read_phy_ocp(tp, PTP_TRX_TS_NS_LO);
-
-        /* seconds */
-        //S[47:32] E44E[15:0]
-        ts64->tv_sec = rtl8126_mdio_direct_read_phy_ocp(tp, PTP_TRX_TS_S_HI);
-        ts64->tv_sec <<= 16;
-        //S[31:16] E44C[15:0]
-        ts64->tv_sec |= rtl8126_mdio_direct_read_phy_ocp(tp, PTP_TRX_TS_S_MI);
-        ts64->tv_sec <<= 16;
-        //S[15:0]  E44A[15:0]
-        ts64->tv_sec |= rtl8126_mdio_direct_read_phy_ocp(tp, PTP_TRX_TS_S_LO);
+        off = rtl8126_ptp_mac_off_at(tp, egress);
+        ts = (s64)egress + off;
+        *ts64 = ns_to_timespec64(ts < 0 ? 0 : ts);
 }
 
-static void rtl8126_ptp_ingresstime(struct rtl8126_private *tp, struct timespec64 *ts64, u8 type)
+/*
+ * Ask the PHY for the receive time stamp it latched for a frame of this message
+ * type.  Returns 0 when the PHY keeps no latch for the type; the caller must
+ * then leave the frame without a time stamp, because the capture of another
+ * message type is worse than no time stamp at all.
+ */
+static int rtl8126_ptp_ingresstime(struct rtl8126_private *tp, struct timespec64 *ts64, u8 type)
 {
         u16 msgtype;
 
@@ -531,7 +748,7 @@ static void rtl8126_ptp_ingresstime(struct rtl8126_private *tp, struct timespec6
                 msgtype = type << 2;
                 break;
         default:
-                return;
+                return 0;
         }
 
         rtl8126_set_trx_ts_cmd(tp, (TRXTS_SEL | msgtype | BIT_4));
@@ -552,6 +769,8 @@ static void rtl8126_ptp_ingresstime(struct rtl8126_private *tp, struct timespec6
         ts64->tv_sec <<= 16;
         //S[15:0]  E44A[15:0]
         ts64->tv_sec |= rtl8126_mdio_direct_read_phy_ocp(tp, PTP_TRX_TS_S_LO);
+
+        return 1;
 }
 
 static void rtl8126_ptp_tx_hwtstamp(struct rtl8126_private *tp)
@@ -560,7 +779,7 @@ static void rtl8126_ptp_tx_hwtstamp(struct rtl8126_private *tp)
         struct skb_shared_hwtstamps shhwtstamps = { 0 };
         struct timespec64 ts64;
 
-        rtl8126_ptp_egresstime(tp, &ts64);
+        rtl8126_ptp_tx_egresstime(tp, &ts64);
 
         /* Upper 32 bits contain s, lower 32 bits contain ns. */
         shhwtstamps.hwtstamp = ktime_set(ts64.tv_sec,
@@ -584,19 +803,29 @@ static void rtl8126_ptp_tx_work(struct work_struct *work)
 {
         struct rtl8126_private *tp = container_of(work, struct rtl8126_private,
                                      ptp_tx_work);
-        unsigned long flags;
         bool tx_intr;
+        int i;
+        u8 isr;
 
         if (!tp->ptp_tx_skb)
                 return;
 
-        rtnl_lock();
-        if (rtl8126_mac_ocp_read(tp, PTP_DUMMY_REG) & TX_TS_INTR) {
-                tx_intr = true;
-                rtl8126_mac_ocp_write(tp, PTP_DUMMY_REG, TX_TS_INTR);
-        } else
-                tx_intr = false;
-        rtnl_unlock();
+        /*
+         * The MAC PTP block reports the egress of the PTP frame.  That report
+         * follows the frame: right away when the port is idle, and with the
+         * time the transmit queue is backed up when it is not, so wait for it
+         * briefly here rather than waking up once per microsecond.
+         */
+        tx_intr = false;
+        for (i = 0; i < 50; i++) {
+                isr = RTL_R8(tp, PTP_ISR_8125);
+                if (isr & PTP_ISR_TOK) {
+                        RTL_W8(tp, PTP_ISR_8125, PTP_ISR_TOK | PTP_ISR_TER);
+                        tx_intr = true;
+                        break;
+                }
+                udelay(2);
+        }
 
         if (time_is_before_jiffies(tp->ptp_tx_start +
                                    RTL8126_PTP_TX_TIMEOUT)) {
@@ -608,11 +837,14 @@ static void rtl8126_ptp_tx_work(struct work_struct *work)
         }
 
         if (tx_intr) {
-                r8126_spin_lock(&tp->phy_lock, flags);
                 rtl8126_ptp_tx_hwtstamp(tp);
-                r8126_spin_unlock(&tp->phy_lock, flags);
         } else {
-                /* reschedule to check later */
+                /*
+                 * Reschedule to check later.  A frame the MAC does not
+                 * recognise as a PTP event is never reported, so do not spin on
+                 * it for the whole timeout.
+                 */
+                msleep(1);
                 schedule_work(&tp->ptp_tx_work);
         }
 }
@@ -628,8 +860,8 @@ static int rtl8126_hwtstamp_enable(struct rtl8126_private *tp, bool enable)
         /* trx timestamp interrupt disable */
         rtl8126_clear_eth_phy_ocp_bit(tp, PTP_INER, RX_TS_INTR | TX_TS_INTR);
 
-        //clear ptp isr
-        rtl8126_mac_ocp_write(tp, PTP_DUMMY_REG, 0xffff);
+        /* MAC PTP block: source of the TX timestamps, see above */
+        rtl8126_ptp_mac_tx_enable(tp, enable);
 
         if (enable) {
                 //tx timestamp interrupt enable
@@ -893,18 +1125,20 @@ int rtl8126_ptp_ioctl(struct net_device *netdev, struct ifreq *ifr, int cmd)
 
 static void rtl8126_rx_ptp_pktstamp(struct rtl8126_private *tp, struct sk_buff *skb, u8 type)
 {
-        struct timespec64 ts64;
-        unsigned long flags;
+	struct timespec64 ts64;
+	unsigned long flags;
+	int captured;
 
-        r8126_spin_lock(&tp->phy_lock, flags);
+	r8126_spin_lock(&tp->phy_lock, flags);
 
-        rtl8126_ptp_ingresstime(tp, &ts64, type);
+	captured = rtl8126_ptp_ingresstime(tp, &ts64, type);
 
-        r8126_spin_unlock(&tp->phy_lock, flags);
+	r8126_spin_unlock(&tp->phy_lock, flags);
 
-        skb_hwtstamps(skb)->hwtstamp = ktime_set(ts64.tv_sec, ts64.tv_nsec);
+	if (captured)
+		skb_hwtstamps(skb)->hwtstamp = ktime_set(ts64.tv_sec, ts64.tv_nsec);
 
-        return;
+	return;
 }
 
 void rtl8126_rx_ptp_timestamp(struct rtl8126_private *tp, struct sk_buff *skb)
@@ -923,6 +1157,17 @@ void rtl8126_rx_ptp_timestamp(struct rtl8126_private *tp, struct sk_buff *skb)
                 return;
 
         msgtype = ptp_get_msgtype(hdr, ptp_class);
+        /*
+         * A master whose frames the kernel classifies as PTPv1 gets its message
+         * type from the control field, and an 802.1AS style master that leaves
+         * the control field at zero (the one measured here: it puts the message
+         * type into the type byte, and only into the type byte) then has every
+         * frame stamped with the receive capture of some other message type,
+         * because the PHY keeps one capture per type.  The type byte is what
+         * the capture select has to agree with.
+         */
+        if (ptp_class & PTP_CLASS_V1)
+                msgtype = hdr->tsmt & 0x0f;
         rtl8126_rx_ptp_pktstamp(tp, skb, msgtype);
 
         return;
